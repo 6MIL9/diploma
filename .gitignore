@@ -25,7 +25,6 @@ Thumbs.db
 
 # Local training artifacts and evaluation outputs
 checkpoints/
-eval/
 
 # Local notes
 comands.txt
