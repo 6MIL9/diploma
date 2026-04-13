@@ -37,6 +37,36 @@ def load_time_from_snapshot(csv_path: Union[str, Path], time_col: str = "Time") 
         raise ValueError(f"Column '{time_col}' not found in {csv_path}. Columns: {list(df0.columns)}")
     return float(df0.loc[0, time_col])
 
+
+def sample_without_replacement_weighted(
+    rng: np.random.Generator,
+    n_total: int,
+    k: int,
+    weights: np.ndarray,
+    exclude: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    if exclude is None:
+        exclude = np.zeros(n_total, dtype=bool)
+    else:
+        exclude = exclude.astype(bool, copy=False)
+
+    w = weights.astype(np.float64, copy=True)
+    w[exclude] = 0.0
+    w[w < 0] = 0.0
+
+    s = w.sum()
+    if s <= 0:
+        candidates = np.flatnonzero(~exclude)
+        if len(candidates) == 0:
+            return np.array([], dtype=np.int64)
+        return rng.choice(candidates, size=min(k, len(candidates)), replace=False)
+
+    p = w / s
+    candidates = np.flatnonzero(p > 0)
+    if len(candidates) == 0:
+        return np.array([], dtype=np.int64)
+    return rng.choice(n_total, size=min(k, len(candidates)), replace=False, p=p)
+
 def build_collocation_points(
     snapshot_files: Iterable[Union[str, Path]],
     n_per_snapshot: int = 1000,
@@ -44,10 +74,16 @@ def build_collocation_points(
     y_bounds: Tuple[float, float] = (0.0, 2.0),
     time_col: str = "Time",
     base_seed: int = 12345,
+    phi_col: str = "phi",
+    uniform_frac: float = 0.6,
+    interface_frac: float = 0.4,
+    delta_gamma: float = 2.0,
 ) -> pd.DataFrame:
     """
     For each snapshot, generate n_per_snapshot collocation points (x,y,t).
-    Spatial points are Hammersley + per-snapshot random shift (mod 1).
+    Spatial points are a mixture of:
+      1) Hammersley + per-snapshot random shift (global coverage)
+      2) interface-focused samples weighted by delta ~= 1 - phi^2
     Time is read from snapshot CSV column `time_col`.
     """
     x0, x1 = map(float, x_bounds)
@@ -55,24 +91,64 @@ def build_collocation_points(
 
     snapshot_files = [Path(f) for f in snapshot_files]
 
-    # Base Hammersley pattern (unit square)
-    uv0 = hammersley_2d_unit(n_per_snapshot)
+    total_frac = uniform_frac + interface_frac
+    if not np.isclose(total_frac, 1.0):
+        uniform_frac = uniform_frac / total_frac
+        interface_frac = interface_frac / total_frac
+
+    n_uniform = int(round(n_per_snapshot * uniform_frac))
+    n_interface = n_per_snapshot - n_uniform
+
+    uv0 = hammersley_2d_unit(max(n_uniform, 1))
 
     chunks = []
     for k, f in enumerate(snapshot_files):
         t = load_time_from_snapshot(f, time_col=time_col)
+        df = pd.read_csv(f)
+        for col in ["Points:0", "Points:1", phi_col]:
+            if col not in df.columns:
+                raise ValueError(f"Missing column '{col}' in {f}. Columns: {list(df.columns)}")
+
+        df_sorted = df.sort_values(["Points:1", "Points:0"]).reset_index(drop=True)
 
         # Deterministic per-snapshot RNG (reproducible across runs)
         # Using snapshot index to keep reproducible even if times are float-ish.
         rng = np.random.default_rng(base_seed + k)
 
-        # Two independent shifts in [0,1)
-        shift = rng.random(2, dtype=np.float64)
+        parts = []
 
-        uv = cranley_patterson_shift(uv0, shift)
+        if n_uniform > 0:
+            shift = rng.random(2, dtype=np.float64)
+            uv = cranley_patterson_shift(uv0[:n_uniform], shift)
+            x_uniform = x0 + (x1 - x0) * uv[:, 0]
+            y_uniform = y0 + (y1 - y0) * uv[:, 1]
+            parts.append(np.column_stack([x_uniform, y_uniform]))
 
-        x = x0 + (x1 - x0) * uv[:, 0]
-        y = y0 + (y1 - y0) * uv[:, 1]
+        if n_interface > 0:
+            phi = df_sorted[phi_col].to_numpy(dtype=np.float64)
+            delta = 1.0 - phi * phi
+            weights = np.power(np.clip(delta, 0.0, None), float(delta_gamma))
+            idx = sample_without_replacement_weighted(
+                rng=rng,
+                n_total=len(df_sorted),
+                k=n_interface,
+                weights=weights,
+            )
+            if len(idx) > 0:
+                xy_int = df_sorted.loc[idx, ["Points:0", "Points:1"]].to_numpy(dtype=np.float64)
+                parts.append(xy_int)
+
+        xy = np.concatenate(parts, axis=0)
+        if len(xy) < n_per_snapshot:
+            need = n_per_snapshot - len(xy)
+            shift = rng.random(2, dtype=np.float64)
+            uv = cranley_patterson_shift(hammersley_2d_unit(need), shift)
+            x_fill = x0 + (x1 - x0) * uv[:, 0]
+            y_fill = y0 + (y1 - y0) * uv[:, 1]
+            xy = np.concatenate([xy, np.column_stack([x_fill, y_fill])], axis=0)
+
+        x = xy[:n_per_snapshot, 0]
+        y = xy[:n_per_snapshot, 1]
 
         data = {
             "x": x,
@@ -111,6 +187,10 @@ if __name__ == "__main__":
         y_bounds=(0.0, 2.0),
         time_col="Time",
         base_seed=20260223,
+        phi_col="phi",
+        uniform_frac=0.6,
+        interface_frac=0.4,
+        delta_gamma=2.0,
     )
     out_path = "datasets/collocation.csv"
 

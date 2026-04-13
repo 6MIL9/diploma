@@ -27,6 +27,8 @@ class PipelineConfig:
     lr_pretrain: float = 1e-3
     lr_full: float = 1e-4
     pretrain_epochs: int = 200
+    flow_stage_epochs: int = 200
+    joint_finetune_epochs: int = 100
     full_train_epochs: int = 1000
 
     batch_data: int = 8192
@@ -38,6 +40,9 @@ class PipelineConfig:
     lambda_data_full: float = 10.0
     lambda_uvp_full: float = 5.0
     lambda_pressure_gauge: float = 1.0
+    lambda_u_supervised: float = 1.0
+    lambda_v_supervised: float = 1.0
+    lambda_p_supervised: float = 5.0
 
     pretrain_ckpt_path: str = "checkpoints_uvp/model_pretrain.pt"
     full_ckpt_path: str = "checkpoints_uvp/model_full.pt"
@@ -47,6 +52,16 @@ class PipelineConfig:
     full_weights_dir: str = "checkpoints_uvp/full_weights"
     full_latest_state_path: str = "checkpoints_uvp/full_state/latest.pt"
     full_latest_history_path: str = "checkpoints_uvp/full_state/latest_history.json"
+    flow_save_every: int = 50
+    flow_state_dir: str = "checkpoints_uvp/flow_state"
+    flow_weights_dir: str = "checkpoints_uvp/flow_weights"
+    flow_latest_state_path: str = "checkpoints_uvp/flow_state/latest.pt"
+    flow_latest_history_path: str = "checkpoints_uvp/flow_state/latest_history.json"
+    flow_supervised_save_every: int = 50
+    flow_supervised_state_dir: str = "checkpoints_uvp/flow_supervised_state"
+    flow_supervised_weights_dir: str = "checkpoints_uvp/flow_supervised_weights"
+    flow_supervised_latest_state_path: str = "checkpoints_uvp/flow_supervised_state/latest.pt"
+    flow_supervised_latest_history_path: str = "checkpoints_uvp/flow_supervised_state/latest_history.json"
 
     s_pretrain: float = 5.0
     s_full_start: float = 10.0
@@ -74,6 +89,7 @@ class PipelineConfig:
     depth: int = 4
     out_dim: int = 4
     activation: str = "tanh"
+    model_style: str = "two_head"
 
     ema_beta: float = 0.99
     ema_eps: float = 1e-8
@@ -164,17 +180,21 @@ class UVPPoints(Dataset):
 
             xy = np.array(df[["Points:0", "Points:1"]].to_numpy(), dtype=np.float32, copy=True)
             gauge_idx = np.argmin((xy[:, 0] - gauge_x) ** 2 + (xy[:, 1] - gauge_y) ** 2)
-            p_gauge = float(df.iloc[gauge_idx]["p"])
+            y_np = np.array(df["Points:1"].to_numpy(), dtype=np.float32, copy=True)
+            p_np = np.array(df["p"].to_numpy(), dtype=np.float32, copy=True)
+            p_bg = fit_linear_pressure_background(y_np, p_np)
+            p_residual = p_np - p_bg
+            p_gauge = float(p_residual[gauge_idx])
 
             frames.append(
                 pd.DataFrame(
                     {
                         "x": np.array(df["Points:0"].to_numpy(), dtype=np.float32, copy=True),
-                        "y": np.array(df["Points:1"].to_numpy(), dtype=np.float32, copy=True),
+                        "y": y_np,
                         "t": np.array(df["Time"].to_numpy(), dtype=np.float32, copy=True),
                         "u": np.array(df["U:0"].to_numpy(), dtype=np.float32, copy=True),
                         "v": np.array(df["U:1"].to_numpy(), dtype=np.float32, copy=True),
-                        "p": np.array(df["p"].to_numpy(), dtype=np.float32, copy=True) - p_gauge,
+                        "p": p_residual - p_gauge,
                     }
                 )
             )
@@ -197,6 +217,18 @@ class AdaptiveSwish(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sigmoid(self.beta * x)
+
+
+def fit_linear_pressure_background(y: np.ndarray, p: np.ndarray) -> np.ndarray:
+    """
+    Fit a simple affine background p_bg(y) = a + b*y and return it at each y.
+    This lets the model focus on the pressure residual instead of spending
+    capacity on the dominant hydrostatic-like vertical trend.
+    """
+    y64 = np.asarray(y, dtype=np.float64).reshape(-1)
+    p64 = np.asarray(p, dtype=np.float64).reshape(-1)
+    a, b = np.polyfit(y64, p64, deg=1)
+    return (a * y64 + b).astype(np.float32)
 
 
 def make_activation(name: str) -> nn.Module:
@@ -241,6 +273,48 @@ class MLP(nn.Module):
         return self.net(xyt)
 
 
+class TwoHeadMLP(nn.Module):
+    def __init__(
+        self,
+        in_dim: int = 3,
+        hidden: int = 64,
+        depth: int = 4,
+        activation: str = "tanh",
+    ):
+        super().__init__()
+        if depth < 2:
+            raise ValueError("TwoHeadMLP expects depth >= 2")
+
+        trunk_layers: list[nn.Module] = [nn.Linear(in_dim, hidden), make_activation(activation)]
+        for _ in range(depth - 2):
+            trunk_layers.extend([nn.Linear(hidden, hidden), make_activation(activation)])
+        self.trunk = nn.Sequential(*trunk_layers)
+
+        self.alpha_head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            make_activation(activation),
+            nn.Linear(hidden, 1),
+        )
+        self.flow_head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            make_activation(activation),
+            nn.Linear(hidden, 3),
+        )
+        self._init()
+
+    def _init(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_normal_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def forward(self, xyt: torch.Tensor) -> torch.Tensor:
+        features = self.trunk(xyt)
+        flow = self.flow_head(features)
+        alpha = self.alpha_head(features)
+        return torch.cat([flow, alpha], dim=1)
+
+
 class PinnWorkflow:
     def __init__(self, cfg: PipelineConfig):
         self.cfg = cfg
@@ -266,16 +340,40 @@ class PinnWorkflow:
         )
 
     def build_model(self) -> nn.Module:
-        return MLP(
-            in_dim=3,
-            out_dim=self.cfg.out_dim,
-            hidden=self.cfg.hidden,
-            depth=self.cfg.depth,
-            activation=self.cfg.activation,
-        ).to(self.cfg.device).to(self.cfg.dtype)
+        if self.cfg.model_style == "two_head":
+            model = TwoHeadMLP(
+                in_dim=3,
+                hidden=self.cfg.hidden,
+                depth=self.cfg.depth,
+                activation=self.cfg.activation,
+            )
+        elif self.cfg.model_style == "single_head":
+            model = MLP(
+                in_dim=3,
+                out_dim=self.cfg.out_dim,
+                hidden=self.cfg.hidden,
+                depth=self.cfg.depth,
+                activation=self.cfg.activation,
+            )
+        else:
+            raise ValueError(f"Unsupported model_style: {self.cfg.model_style}")
+        return model.to(self.cfg.device).to(self.cfg.dtype)
 
     def build_optimizer(self, model: nn.Module, lr: float) -> torch.optim.Optimizer:
-        return torch.optim.Adam(model.parameters(), lr=lr)
+        params = [p for p in model.parameters() if p.requires_grad]
+        return torch.optim.Adam(params, lr=lr)
+
+    @staticmethod
+    def freeze_alpha_head(model: nn.Module) -> None:
+        if not hasattr(model, "alpha_head"):
+            raise ValueError("freeze_alpha_head() requires a model with alpha_head")
+        for param in model.alpha_head.parameters():
+            param.requires_grad = False
+
+    @staticmethod
+    def unfreeze_all(model: nn.Module) -> None:
+        for param in model.parameters():
+            param.requires_grad = True
 
     def load_checkpoint_weights(self, model: nn.Module, ckpt_path: str) -> nn.Module:
         state = torch.load(ckpt_path, map_location=self.cfg.device)
@@ -351,6 +449,15 @@ class PinnWorkflow:
         l_p = torch.mean((p_pred_nd - p_true_nd) ** 2)
         return l_u, l_v, l_p
 
+    def weighted_uvp_supervision_loss(self, model: nn.Module, xyt: torch.Tensor, uvp_true: torch.Tensor):
+        l_u, l_v, l_p = self.uvp_supervision_loss(model, xyt, uvp_true)
+        loss_uvp = (
+            self.cfg.lambda_u_supervised * l_u
+            + self.cfg.lambda_v_supervised * l_v
+            + self.cfg.lambda_p_supervised * l_p
+        )
+        return loss_uvp, l_u, l_v, l_p
+
     def pressure_gauge_loss(self, model: nn.Module) -> torch.Tensor:
         gauge_point = torch.tensor(
             [[self.cfg.p_gauge_x, self.cfg.p_gauge_y, self.cfg.p_gauge_t]],
@@ -370,6 +477,22 @@ class PinnWorkflow:
         if epoch <= 500:
             return 1.0, 1.0, 1.0, 0.02, 0.15
         return 1.0, 1.0, 1.2, 0.05, 0.20
+
+    def get_flow_stage_weights(self, epoch: int):
+        if epoch <= 50:
+            return 1.0, 0.3, 1.0, 0.03
+        if epoch <= 100:
+            return 1.0, 0.3, 1.5, 0.05
+        return 1.0, 0.2, 2.0, 0.08
+
+    def get_joint_finetune_weights(self, epoch: int):
+        if epoch <= 25:
+            return 1.0, 0.2, 0.2, 0.0, 0.01
+        if epoch <= 50:
+            return 1.0, 0.3, 0.3, 0.0, 0.02
+        if epoch <= 75:
+            return 1.0, 0.4, 0.5, 0.0, 0.03
+        return 1.0, 0.5, 0.7, 0.01, 0.05
 
     def get_s_full(self, epoch: int) -> float:
         if self.cfg.s_full_ramp_epochs <= 0:
@@ -501,6 +624,62 @@ class PinnWorkflow:
         }
 
     @staticmethod
+    def make_flow_history() -> dict:
+        return {
+            "epoch": [],
+            "loss": [],
+            "loss_uvp": [],
+            "loss_phys": [],
+            "loss_gauge": [],
+            "L_u": [],
+            "L_v": [],
+            "L_p": [],
+            "L_div": [],
+            "L_adv": [],
+            "L_mom": [],
+            "L_eik": [],
+            "ema_div": [],
+            "ema_adv": [],
+            "ema_mom": [],
+            "ema_eik": [],
+            "s": [],
+        }
+
+    @staticmethod
+    def make_flow_supervised_history() -> dict:
+        return {
+            "epoch": [],
+            "loss": [],
+            "loss_uvp": [],
+            "L_u": [],
+            "L_v": [],
+            "L_p": [],
+        }
+
+    @staticmethod
+    def make_joint_history() -> dict:
+        return {
+            "epoch": [],
+            "loss": [],
+            "loss_data": [],
+            "loss_uvp": [],
+            "loss_phys": [],
+            "loss_gauge": [],
+            "s": [],
+            "L_u": [],
+            "L_v": [],
+            "L_p": [],
+            "L_div": [],
+            "L_adv": [],
+            "L_mom": [],
+            "L_eik": [],
+            "ema_div": [],
+            "ema_adv": [],
+            "ema_mom": [],
+            "ema_eik": [],
+        }
+
+    @staticmethod
     def _ema_to_cpu(ema: dict) -> dict:
         out = {}
         for key, value in ema.items():
@@ -523,6 +702,96 @@ class PinnWorkflow:
             weights_path,
         )
         print(f"Saved full weights: {weights_path}")
+
+    def save_flow_stage_state(
+        self,
+        model: nn.Module,
+        opt: torch.optim.Optimizer,
+        history: dict,
+        ema: dict,
+        ema_steps: int,
+        epoch: int,
+        save_periodic: bool = False,
+    ) -> None:
+        os.makedirs(self.cfg.flow_state_dir, exist_ok=True)
+        state = {
+            "epoch": epoch,
+            "stage": "flow",
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": opt.state_dict(),
+            "history": history,
+            "ema": self._ema_to_cpu(ema),
+            "ema_steps": ema_steps,
+        }
+
+        torch.save(state, self.cfg.flow_latest_state_path)
+        with open(self.cfg.flow_latest_history_path, "w", encoding="utf-8") as fh:
+            json.dump(history, fh, ensure_ascii=False, indent=2)
+
+        if save_periodic:
+            state_path = f"{self.cfg.flow_state_dir}/flow_epoch_{epoch:04d}.pt"
+            history_path = f"{self.cfg.flow_state_dir}/flow_epoch_{epoch:04d}_history.json"
+            torch.save(state, state_path)
+            with open(history_path, "w", encoding="utf-8") as fh:
+                json.dump(history, fh, ensure_ascii=False, indent=2)
+            print(f"Saved flow-stage state: {state_path}")
+            print(f"Saved flow-stage history: {history_path}")
+
+    def save_flow_weights(self, model: nn.Module, epoch: int) -> None:
+        os.makedirs(self.cfg.flow_weights_dir, exist_ok=True)
+        weights_path = f"{self.cfg.flow_weights_dir}/model_flow_epoch_{epoch:04d}.pt"
+        torch.save(
+            {
+                "epoch": epoch,
+                "stage": "flow",
+                "model_state_dict": model.state_dict(),
+            },
+            weights_path,
+        )
+        print(f"Saved flow weights: {weights_path}")
+
+    def save_flow_supervised_state(
+        self,
+        model: nn.Module,
+        opt: torch.optim.Optimizer,
+        history: dict,
+        epoch: int,
+        save_periodic: bool = False,
+    ) -> None:
+        os.makedirs(self.cfg.flow_supervised_state_dir, exist_ok=True)
+        state = {
+            "epoch": epoch,
+            "stage": "flow_supervised",
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": opt.state_dict(),
+            "history": history,
+        }
+
+        torch.save(state, self.cfg.flow_supervised_latest_state_path)
+        with open(self.cfg.flow_supervised_latest_history_path, "w", encoding="utf-8") as fh:
+            json.dump(history, fh, ensure_ascii=False, indent=2)
+
+        if save_periodic:
+            state_path = f"{self.cfg.flow_supervised_state_dir}/flow_supervised_epoch_{epoch:04d}.pt"
+            history_path = f"{self.cfg.flow_supervised_state_dir}/flow_supervised_epoch_{epoch:04d}_history.json"
+            torch.save(state, state_path)
+            with open(history_path, "w", encoding="utf-8") as fh:
+                json.dump(history, fh, ensure_ascii=False, indent=2)
+            print(f"Saved flow-supervised state: {state_path}")
+            print(f"Saved flow-supervised history: {history_path}")
+
+    def save_flow_supervised_weights(self, model: nn.Module, epoch: int) -> None:
+        os.makedirs(self.cfg.flow_supervised_weights_dir, exist_ok=True)
+        weights_path = f"{self.cfg.flow_supervised_weights_dir}/model_flow_supervised_epoch_{epoch:04d}.pt"
+        torch.save(
+            {
+                "epoch": epoch,
+                "stage": "flow_supervised",
+                "model_state_dict": model.state_dict(),
+            },
+            weights_path,
+        )
+        print(f"Saved flow-supervised weights: {weights_path}")
 
     def save_full_training_state(
         self,
@@ -684,8 +953,7 @@ class PinnWorkflow:
                         phi_pred = torch.tanh(s_full_tensor * alpha_d)
                         loss_data = torch.mean((phi_pred - phi_true) ** 2)
 
-                        l_u, l_v, l_p = self.uvp_supervision_loss(model, xyt_uvp, uvp_true)
-                        loss_uvp = l_u + l_v + l_p
+                        loss_uvp, l_u, l_v, l_p = self.weighted_uvp_supervision_loss(model, xyt_uvp, uvp_true)
 
                         res = self.residuals(model, xyt_p, s_val=s_full)
                         l_div = torch.mean(res["r_div"] ** 2)
@@ -807,4 +1075,423 @@ class PinnWorkflow:
                 )
 
         self.save_checkpoint(model, self.cfg.full_ckpt_path, last_completed_epoch, stage="full")
+        return history
+
+    def train_flow_stage(
+        self,
+        model: nn.Module,
+        opt: torch.optim.Optimizer,
+        epochs: int,
+        start_epoch: int = 1,
+        history: dict | None = None,
+        ema: dict | None = None,
+        ema_steps: int = 0,
+    ):
+        history = self.make_flow_history() if history is None else history
+        ema = {"div": None, "adv": None, "mom": None, "eik": None} if ema is None else ema
+
+        def ema_update(key: str, value: torch.Tensor) -> None:
+            nonlocal ema_steps
+            detached = value.detach()
+            if ema[key] is None:
+                ema[key] = detached
+            else:
+                ema[key] = self.cfg.ema_beta * ema[key] + (1.0 - self.cfg.ema_beta) * detached
+
+        def ema_scale(key: str) -> torch.Tensor:
+            if ema[key] is None:
+                raise RuntimeError(f"EMA for {key} is not initialized")
+            if ema_steps < self.cfg.ema_warmup_steps:
+                return (ema[key] + self.cfg.ema_eps).detach() + 1.0
+            return (ema[key] + self.cfg.ema_eps).detach()
+
+        self.freeze_alpha_head(model)
+        n_steps = max(len(self.phys_loader), len(self.uvp_loader))
+        last_completed_epoch = history["epoch"][-1] if history["epoch"] else (start_epoch - 1)
+
+        try:
+            for epoch in range(start_epoch, epochs + 1):
+                model.train()
+                s_full = self.get_s_full(epoch)
+                running = {k: 0.0 for k in [
+                    "loss", "loss_uvp", "loss_phys", "loss_gauge",
+                    "L_u", "L_v", "L_p", "L_div", "L_adv", "L_mom", "L_eik"
+                ]}
+
+                phys_iter = cycle(self.phys_loader)
+                uvp_iter = cycle(self.uvp_loader)
+
+                with tqdm(
+                    range(n_steps),
+                    desc=f"Flow stage {epoch}/{epochs}",
+                    total=n_steps,
+                    dynamic_ncols=True,
+                    leave=False,
+                ) as pbar:
+                    for _ in pbar:
+                        xyt_p_np = next(phys_iter)
+                        xyt_uvp_np, uvp_np = next(uvp_iter)
+
+                        xyt_p = xyt_p_np.to(self.cfg.device, dtype=self.cfg.dtype)
+                        xyt_uvp = xyt_uvp_np.to(self.cfg.device, dtype=self.cfg.dtype)
+                        uvp_true = uvp_np.to(self.cfg.device, dtype=self.cfg.dtype)
+
+                        loss_uvp, l_u, l_v, l_p = self.weighted_uvp_supervision_loss(model, xyt_uvp, uvp_true)
+
+                        res = self.residuals(model, xyt_p, s_val=s_full)
+                        l_div = torch.mean(res["r_div"] ** 2)
+                        l_adv = torch.mean(res["r_adv"] ** 2)
+                        l_eik = torch.mean(res["r_eik"] ** 2)
+                        l_mom = torch.mean(res["r_mom_u"] ** 2) + torch.mean(res["r_mom_v"] ** 2)
+                        loss_gauge = self.pressure_gauge_loss(model)
+
+                        ema_update("div", l_div)
+                        ema_update("adv", l_adv)
+                        ema_update("mom", l_mom)
+                        ema_update("eik", l_eik)
+                        ema_steps += 1
+
+                        l_div_n = l_div / ema_scale("div")
+                        l_adv_n = l_adv / ema_scale("adv")
+                        l_mom_n = l_mom / ema_scale("mom")
+                        l_eik_n = l_eik / ema_scale("eik")
+
+                        w_div, w_adv, w_mom, lam_phys = self.get_flow_stage_weights(epoch)
+                        loss_phys = w_div * l_div_n + w_adv * l_adv_n + w_mom * l_mom_n
+                        loss = self.cfg.lambda_uvp_full * loss_uvp + lam_phys * loss_phys + self.cfg.lambda_pressure_gauge * loss_gauge
+
+                        opt.zero_grad(set_to_none=True)
+                        loss.backward()
+                        opt.step()
+
+                        running["loss"] += float(loss.item())
+                        running["loss_uvp"] += float(loss_uvp.item())
+                        running["loss_phys"] += float(loss_phys.item())
+                        running["loss_gauge"] += float(loss_gauge.item())
+                        running["L_u"] += float(l_u.item())
+                        running["L_v"] += float(l_v.item())
+                        running["L_p"] += float(l_p.item())
+                        running["L_div"] += float(l_div.item())
+                        running["L_adv"] += float(l_adv.item())
+                        running["L_mom"] += float(l_mom.item())
+                        running["L_eik"] += float(l_eik.item())
+
+                        pbar.set_postfix(
+                            loss=f"{loss.item():.4e}",
+                            loss_uvp=f"{loss_uvp.item():.2e}",
+                            loss_gauge=f"{loss_gauge.item():.2e}",
+                            s=f"{s_full:.1f}",
+                            lambda_phys=f"{lam_phys:.2e}",
+                            mom=f"{l_mom.item():.2e}",
+                            u=f"{l_u.item():.2e}",
+                            v=f"{l_v.item():.2e}",
+                            p=f"{l_p.item():.2e}",
+                        )
+
+                history["epoch"].append(epoch)
+                history["loss"].append(running["loss"] / n_steps)
+                history["loss_uvp"].append(running["loss_uvp"] / n_steps)
+                history["loss_phys"].append(running["loss_phys"] / n_steps)
+                history["loss_gauge"].append(running["loss_gauge"] / n_steps)
+                history["L_u"].append(running["L_u"] / n_steps)
+                history["L_v"].append(running["L_v"] / n_steps)
+                history["L_p"].append(running["L_p"] / n_steps)
+                history["L_div"].append(running["L_div"] / n_steps)
+                history["L_adv"].append(running["L_adv"] / n_steps)
+                history["L_mom"].append(running["L_mom"] / n_steps)
+                history["L_eik"].append(running["L_eik"] / n_steps)
+                history["ema_div"].append(float(ema["div"].item()))
+                history["ema_adv"].append(float(ema["adv"].item()))
+                history["ema_mom"].append(float(ema["mom"].item()))
+                history["ema_eik"].append(float(ema["eik"].item()))
+                history["s"].append(s_full)
+                last_completed_epoch = epoch
+
+                self.save_flow_stage_state(
+                    model,
+                    opt,
+                    history,
+                    ema,
+                    ema_steps,
+                    epoch,
+                    save_periodic=(epoch % self.cfg.flow_save_every == 0),
+                )
+                if epoch % self.cfg.flow_save_every == 0:
+                    self.save_flow_weights(model, epoch)
+
+                if epoch % 25 == 0 or epoch == start_epoch:
+                    print(
+                        f"flow_epoch={epoch:5d} "
+                        f"s={history['s'][-1]:.2f} "
+                        f"loss={history['loss'][-1]:.4e} "
+                        f"loss_uvp={history['loss_uvp'][-1]:.4e} "
+                        f"loss_phys={history['loss_phys'][-1]:.4e} "
+                        f"loss_gauge={history['loss_gauge'][-1]:.4e} "
+                        f"lambda_phys={self.get_flow_stage_weights(epoch)[3]:.2e} "
+                        f"L_u={history['L_u'][-1]:.4e} "
+                        f"L_v={history['L_v'][-1]:.4e} "
+                        f"L_p={history['L_p'][-1]:.4e} "
+                        f"L_div={history['L_div'][-1]:.4e} "
+                        f"L_adv={history['L_adv'][-1]:.4e} "
+                        f"L_mom={history['L_mom'][-1]:.4e}"
+                    )
+        finally:
+            if last_completed_epoch >= start_epoch:
+                self.save_flow_stage_state(
+                    model,
+                    opt,
+                    history,
+                    ema,
+                    ema_steps,
+                    last_completed_epoch,
+                    save_periodic=False,
+                )
+
+        return history
+
+    def train_flow_supervised_stage(
+        self,
+        model: nn.Module,
+        opt: torch.optim.Optimizer,
+        epochs: int,
+        start_epoch: int = 1,
+        history: dict | None = None,
+    ):
+        history = self.make_flow_supervised_history() if history is None else history
+        self.freeze_alpha_head(model)
+
+        n_steps = len(self.uvp_loader)
+        last_completed_epoch = history["epoch"][-1] if history["epoch"] else (start_epoch - 1)
+
+        try:
+            for epoch in range(start_epoch, epochs + 1):
+                model.train()
+                running = {"loss": 0.0, "loss_uvp": 0.0, "L_u": 0.0, "L_v": 0.0, "L_p": 0.0}
+
+                with tqdm(
+                    self.uvp_loader,
+                    desc=f"Flow supervised {epoch}/{epochs}",
+                    total=n_steps,
+                    dynamic_ncols=True,
+                    leave=False,
+                ) as pbar:
+                    for xyt_uvp_np, uvp_np in pbar:
+                        xyt_uvp = xyt_uvp_np.to(self.cfg.device, dtype=self.cfg.dtype)
+                        uvp_true = uvp_np.to(self.cfg.device, dtype=self.cfg.dtype)
+
+                        loss_uvp, l_u, l_v, l_p = self.weighted_uvp_supervision_loss(model, xyt_uvp, uvp_true)
+                        loss = self.cfg.lambda_uvp_full * loss_uvp
+
+                        opt.zero_grad(set_to_none=True)
+                        loss.backward()
+                        opt.step()
+
+                        running["loss"] += float(loss.item())
+                        running["loss_uvp"] += float(loss_uvp.item())
+                        running["L_u"] += float(l_u.item())
+                        running["L_v"] += float(l_v.item())
+                        running["L_p"] += float(l_p.item())
+
+                        pbar.set_postfix(
+                            loss=f"{loss.item():.4e}",
+                            loss_uvp=f"{loss_uvp.item():.2e}",
+                            u=f"{l_u.item():.2e}",
+                            v=f"{l_v.item():.2e}",
+                            p=f"{l_p.item():.2e}",
+                        )
+
+                history["epoch"].append(epoch)
+                history["loss"].append(running["loss"] / n_steps)
+                history["loss_uvp"].append(running["loss_uvp"] / n_steps)
+                history["L_u"].append(running["L_u"] / n_steps)
+                history["L_v"].append(running["L_v"] / n_steps)
+                history["L_p"].append(running["L_p"] / n_steps)
+                last_completed_epoch = epoch
+
+                self.save_flow_supervised_state(
+                    model,
+                    opt,
+                    history,
+                    epoch,
+                    save_periodic=(epoch % self.cfg.flow_supervised_save_every == 0),
+                )
+                if epoch % self.cfg.flow_supervised_save_every == 0:
+                    self.save_flow_supervised_weights(model, epoch)
+
+                if epoch % 25 == 0 or epoch == start_epoch:
+                    print(
+                        f"flow_sup_epoch={epoch:5d} "
+                        f"loss={history['loss'][-1]:.4e} "
+                        f"loss_uvp={history['loss_uvp'][-1]:.4e} "
+                        f"L_u={history['L_u'][-1]:.4e} "
+                        f"L_v={history['L_v'][-1]:.4e} "
+                        f"L_p={history['L_p'][-1]:.4e}"
+                    )
+        finally:
+            if last_completed_epoch >= start_epoch:
+                self.save_flow_supervised_state(
+                    model,
+                    opt,
+                    history,
+                    last_completed_epoch,
+                    save_periodic=False,
+                )
+
+        return history
+
+    def train_joint_finetune_stage(
+        self,
+        model: nn.Module,
+        opt: torch.optim.Optimizer,
+        epochs: int,
+        start_epoch: int = 1,
+        history: dict | None = None,
+        ema: dict | None = None,
+        ema_steps: int = 0,
+    ):
+        history = self.make_joint_history() if history is None else history
+        ema = {"div": None, "adv": None, "mom": None, "eik": None} if ema is None else ema
+        self.unfreeze_all(model)
+
+        def ema_update(key: str, value: torch.Tensor) -> None:
+            nonlocal ema_steps
+            detached = value.detach()
+            if ema[key] is None:
+                ema[key] = detached
+            else:
+                ema[key] = self.cfg.ema_beta * ema[key] + (1.0 - self.cfg.ema_beta) * detached
+
+        def ema_scale(key: str) -> torch.Tensor:
+            if ema[key] is None:
+                raise RuntimeError(f"EMA for {key} is not initialized")
+            if ema_steps < self.cfg.ema_warmup_steps:
+                return (ema[key] + self.cfg.ema_eps).detach() + 1.0
+            return (ema[key] + self.cfg.ema_eps).detach()
+
+        n_steps = max(len(self.data_loader), len(self.phys_loader), len(self.uvp_loader))
+
+        for epoch in range(start_epoch, epochs + 1):
+            model.train()
+            s_full = self.get_s_full(epoch)
+            s_full_tensor = torch.tensor(s_full, device=self.cfg.device, dtype=self.cfg.dtype)
+            running = {k: 0.0 for k in [
+                "loss", "loss_data", "loss_uvp", "loss_phys", "loss_gauge",
+                "L_u", "L_v", "L_p", "L_div", "L_adv", "L_mom", "L_eik"
+            ]}
+
+            data_iter = cycle(self.data_loader)
+            phys_iter = cycle(self.phys_loader)
+            uvp_iter = cycle(self.uvp_loader)
+
+            with tqdm(
+                range(n_steps),
+                desc=f"Joint finetune {epoch}/{epochs}",
+                total=n_steps,
+                dynamic_ncols=True,
+                leave=False,
+            ) as pbar:
+                for _ in pbar:
+                    xyt_d_np, phi_np = next(data_iter)
+                    xyt_p_np = next(phys_iter)
+                    xyt_uvp_np, uvp_np = next(uvp_iter)
+
+                    xyt_d = xyt_d_np.to(self.cfg.device, dtype=self.cfg.dtype)
+                    phi_true = phi_np.to(self.cfg.device, dtype=self.cfg.dtype)
+                    xyt_p = xyt_p_np.to(self.cfg.device, dtype=self.cfg.dtype)
+                    xyt_uvp = xyt_uvp_np.to(self.cfg.device, dtype=self.cfg.dtype)
+                    uvp_true = uvp_np.to(self.cfg.device, dtype=self.cfg.dtype)
+
+                    _, _, _, alpha_d = self.model_fields(model, xyt_d)
+                    phi_pred = torch.tanh(s_full_tensor * alpha_d)
+                    loss_data = torch.mean((phi_pred - phi_true) ** 2)
+
+                    loss_uvp, l_u, l_v, l_p = self.weighted_uvp_supervision_loss(model, xyt_uvp, uvp_true)
+
+                    res = self.residuals(model, xyt_p, s_val=s_full)
+                    l_div = torch.mean(res["r_div"] ** 2)
+                    l_adv = torch.mean(res["r_adv"] ** 2)
+                    l_eik = torch.mean(res["r_eik"] ** 2)
+                    l_mom = torch.mean(res["r_mom_u"] ** 2) + torch.mean(res["r_mom_v"] ** 2)
+                    loss_gauge = self.pressure_gauge_loss(model)
+
+                    ema_update("div", l_div)
+                    ema_update("adv", l_adv)
+                    ema_update("mom", l_mom)
+                    ema_update("eik", l_eik)
+                    ema_steps += 1
+
+                    l_div_n = l_div / ema_scale("div")
+                    l_adv_n = l_adv / ema_scale("adv")
+                    l_mom_n = l_mom / ema_scale("mom")
+                    l_eik_n = l_eik / ema_scale("eik")
+
+                    w_div, w_adv, w_mom, w_eik, lam_phys = self.get_joint_finetune_weights(epoch)
+                    loss_phys = w_div * l_div_n + w_adv * l_adv_n + w_mom * l_mom_n + w_eik * l_eik_n
+
+                    loss = (
+                        self.cfg.lambda_data_full * loss_data
+                        + self.cfg.lambda_uvp_full * loss_uvp
+                        + lam_phys * loss_phys
+                        + self.cfg.lambda_pressure_gauge * loss_gauge
+                    )
+
+                    opt.zero_grad(set_to_none=True)
+                    loss.backward()
+                    opt.step()
+
+                    running["loss"] += float(loss.item())
+                    running["loss_data"] += float(loss_data.item())
+                    running["loss_uvp"] += float(loss_uvp.item())
+                    running["loss_phys"] += float(loss_phys.item())
+                    running["loss_gauge"] += float(loss_gauge.item())
+                    running["L_u"] += float(l_u.item())
+                    running["L_v"] += float(l_v.item())
+                    running["L_p"] += float(l_p.item())
+                    running["L_div"] += float(l_div.item())
+                    running["L_adv"] += float(l_adv.item())
+                    running["L_mom"] += float(l_mom.item())
+                    running["L_eik"] += float(l_eik.item())
+
+                    pbar.set_postfix(
+                        loss=f"{loss.item():.4e}",
+                        loss_data=f"{loss_data.item():.2e}",
+                        loss_uvp=f"{loss_uvp.item():.2e}",
+                        lambda_phys=f"{lam_phys:.2e}",
+                        mom=f"{l_mom.item():.2e}",
+                    )
+
+            history["epoch"].append(epoch)
+            history["loss"].append(running["loss"] / n_steps)
+            history["loss_data"].append(running["loss_data"] / n_steps)
+            history["loss_uvp"].append(running["loss_uvp"] / n_steps)
+            history["loss_phys"].append(running["loss_phys"] / n_steps)
+            history["loss_gauge"].append(running["loss_gauge"] / n_steps)
+            history["L_u"].append(running["L_u"] / n_steps)
+            history["L_v"].append(running["L_v"] / n_steps)
+            history["L_p"].append(running["L_p"] / n_steps)
+            history["L_div"].append(running["L_div"] / n_steps)
+            history["L_adv"].append(running["L_adv"] / n_steps)
+            history["L_mom"].append(running["L_mom"] / n_steps)
+            history["L_eik"].append(running["L_eik"] / n_steps)
+            history["ema_div"].append(float(ema["div"].item()))
+            history["ema_adv"].append(float(ema["adv"].item()))
+            history["ema_mom"].append(float(ema["mom"].item()))
+            history["ema_eik"].append(float(ema["eik"].item()))
+            history["s"].append(s_full)
+
+            if epoch % 25 == 0 or epoch == start_epoch:
+                print(
+                    f"joint_epoch={epoch:5d} "
+                    f"s={history['s'][-1]:.2f} "
+                    f"loss={history['loss'][-1]:.4e} "
+                    f"loss_data={history['loss_data'][-1]:.4e} "
+                    f"loss_uvp={history['loss_uvp'][-1]:.4e} "
+                    f"loss_phys={history['loss_phys'][-1]:.4e} "
+                    f"lambda_phys={self.get_joint_finetune_weights(epoch)[4]:.2e} "
+                    f"L_u={history['L_u'][-1]:.4e} "
+                    f"L_v={history['L_v'][-1]:.4e} "
+                    f"L_p={history['L_p'][-1]:.4e} "
+                    f"L_mom={history['L_mom'][-1]:.4e}"
+                )
+
         return history

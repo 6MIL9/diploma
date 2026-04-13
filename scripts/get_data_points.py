@@ -149,9 +149,9 @@ def sample_volume_hammersley_outside_heavy(
     oversample_factor: int = 6,
     base_seed_shift: Optional[np.ndarray] = None,
     exclude_mask: Optional[np.ndarray] = None,
-    outside_frac: float = 0.70,
+    outside_frac: float = 0.50,
     inside_frac: float = 0.20,
-    transition_frac: float = 0.10,
+    transition_frac: float = 0.30,
     phi_outside_thr: float = 0.8,
     phi_inside_thr: float = -0.8,
 ) -> np.ndarray:
@@ -163,8 +163,8 @@ def sample_volume_hammersley_outside_heavy(
       inside:     phi <= phi_inside_thr
       transition: phi_inside_thr < phi < phi_outside_thr
 
-    The goal is to anchor the outer liquid phase more strongly and avoid
-    extra spurious negative regions ("phantom bubbles").
+    The goal is to keep enough outer-phase coverage while giving the network
+    more supervision near the interface, where the PINN is the most sensitive.
     """
     x0, x1 = map(float, x_bounds)
     y0, y1 = map(float, y_bounds)
@@ -240,12 +240,12 @@ def sample_volume_hammersley_outside_heavy(
     if len(picked) < n_volume:
         remaining = n_volume - len(picked)
 
-        # fill priority: outside -> transition -> inside
+        # fill priority: transition -> outside -> inside
         rest_out = np.setdiff1d(outside, picked, assume_unique=False)
         rest_tr = np.setdiff1d(transition, picked, assume_unique=False)
         rest_in = np.setdiff1d(inside, picked, assume_unique=False)
 
-        fill_order = [rest_out, rest_tr, rest_in]
+        fill_order = [rest_tr, rest_out, rest_in]
         for pool in fill_order:
             if remaining <= 0:
                 break
@@ -279,9 +279,9 @@ def build_data_points_dataset(
     base_seed: int = 20260224,
     delta_gamma: float = 2.0,
     boundary_tol: float = 1e-12,
-    outside_frac: float = 0.70,
+    outside_frac: float = 0.50,
     inside_frac: float = 0.20,
-    transition_frac: float = 0.10,
+    transition_frac: float = 0.30,
     phi_outside_thr: float = 0.8,
     phi_inside_thr: float = -0.8,
 ) -> pd.DataFrame:
@@ -389,8 +389,8 @@ if __name__ == "__main__":
     df_data = build_data_points_dataset(
         snapshot_files=snapshot_files,
         out_csv="datasets/data_points_phi.csv",
-        n_interface=400,
-        n_volume=800,
+        n_interface=550,
+        n_volume=650,
         n_boundary=150,
         x_bounds=(0.0, 1.0),
         y_bounds=(0.0, 2.0),
@@ -400,10 +400,11 @@ if __name__ == "__main__":
         delta_gamma=2.0,
         boundary_tol=1e-12,
 
-        # main change: more points outside bubble
-        outside_frac=0.75,
-        inside_frac=0.15,
-        transition_frac=0.10,
+        # More balanced sampling: keep background coverage, but spend more
+        # points on the transition/interface region.
+        outside_frac=0.50,
+        inside_frac=0.20,
+        transition_frac=0.30,
 
         # thresholds for region split
         phi_outside_thr=0.8,
