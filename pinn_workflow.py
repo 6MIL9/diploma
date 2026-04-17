@@ -39,10 +39,8 @@ class PipelineConfig:
     lambda_data_pretrain: float = 20.0
     lambda_data_full: float = 10.0
     lambda_uvp_full: float = 5.0
-    lambda_pressure_gauge: float = 1.0
     lambda_u_supervised: float = 1.0
     lambda_v_supervised: float = 1.0
-    lambda_p_supervised: float = 5.0
 
     pretrain_ckpt_path: str = "checkpoints_uvp/model_pretrain.pt"
     full_ckpt_path: str = "checkpoints_uvp/model_full.pt"
@@ -62,6 +60,11 @@ class PipelineConfig:
     flow_supervised_weights_dir: str = "checkpoints_uvp/flow_supervised_weights"
     flow_supervised_latest_state_path: str = "checkpoints_uvp/flow_supervised_state/latest.pt"
     flow_supervised_latest_history_path: str = "checkpoints_uvp/flow_supervised_state/latest_history.json"
+    warmup_save_every: int = 50
+    warmup_state_dir: str = "checkpoints_uvp/warmup_state"
+    warmup_weights_dir: str = "checkpoints_uvp/warmup_weights"
+    warmup_latest_state_path: str = "checkpoints_uvp/warmup_state/latest.pt"
+    warmup_latest_history_path: str = "checkpoints_uvp/warmup_state/latest_history.json"
 
     s_pretrain: float = 5.0
     s_full_start: float = 10.0
@@ -87,7 +90,7 @@ class PipelineConfig:
 
     hidden: int = 64
     depth: int = 4
-    out_dim: int = 4
+    out_dim: int = 3
     activation: str = "tanh"
     model_style: str = "two_head"
 
@@ -107,16 +110,11 @@ class PipelineConfig:
         self.y_half_range = 0.5 * (self.y_max - self.y_min)
         self.t_half_range = 0.5 * (self.t_max - self.t_min)
 
-        self.p_gauge_x = 0.5 * (self.x_min + self.x_max)
-        self.p_gauge_y = 0.5 * (self.y_min + self.y_max)
-        self.p_gauge_t = self.t_min
-
         self.l_ref = self.x_max - self.x_min
         self.rho_ref = self.rho_l
         self.mu_ref = self.mu_l
         self.u_ref = math.sqrt(abs(self.g_y) * self.l_ref) if abs(self.g_y) > 0.0 else 1.0
         self.t_ref = self.l_ref / self.u_ref
-        self.p_ref = self.rho_ref * self.u_ref**2
 
         self.re_ref = self.rho_ref * self.u_ref * self.l_ref / self.mu_ref
         self.we_ref = self.rho_ref * self.u_ref**2 * self.l_ref / self.sigma
@@ -126,7 +124,7 @@ class PipelineConfig:
     def describe_reference_scales(self) -> str:
         return (
             f"Reference scales: L={self.l_ref:.4f}, U={self.u_ref:.4f}, T={self.t_ref:.4f}, "
-            f"P={self.p_ref:.4f}, Re={self.re_ref:.4f}, We={self.we_ref:.4f}, "
+            f"Re={self.re_ref:.4f}, We={self.we_ref:.4f}, "
             f"Gx={self.g_x_ref:.4f}, Gy={self.g_y_ref:.4f}"
         )
 
@@ -165,49 +163,40 @@ class PhysicsPoints(Dataset):
 
 
 class UVPPoints(Dataset):
-    def __init__(self, eval_glob: str, gauge_x: float, gauge_y: float):
+    def __init__(self, eval_glob: str):
         paths = sorted(glob.glob(eval_glob))
         if not paths:
             raise ValueError(f"No eval files found for pattern: {eval_glob}")
 
         frames: list[pd.DataFrame] = []
-        required = ["Time", "Points:0", "Points:1", "U:0", "U:1", "p"]
+        required = ["Time", "Points:0", "Points:1", "U:0", "U:1"]
         for csv_path in paths:
             df = pd.read_csv(csv_path)
             for col in required:
                 if col not in df.columns:
                     raise ValueError(f"Missing column '{col}' in {csv_path}. Columns: {df.columns}")
 
-            xy = np.array(df[["Points:0", "Points:1"]].to_numpy(), dtype=np.float32, copy=True)
-            gauge_idx = np.argmin((xy[:, 0] - gauge_x) ** 2 + (xy[:, 1] - gauge_y) ** 2)
-            y_np = np.array(df["Points:1"].to_numpy(), dtype=np.float32, copy=True)
-            p_np = np.array(df["p"].to_numpy(), dtype=np.float32, copy=True)
-            p_bg = fit_linear_pressure_background(y_np, p_np)
-            p_residual = p_np - p_bg
-            p_gauge = float(p_residual[gauge_idx])
-
             frames.append(
                 pd.DataFrame(
                     {
                         "x": np.array(df["Points:0"].to_numpy(), dtype=np.float32, copy=True),
-                        "y": y_np,
+                        "y": np.array(df["Points:1"].to_numpy(), dtype=np.float32, copy=True),
                         "t": np.array(df["Time"].to_numpy(), dtype=np.float32, copy=True),
                         "u": np.array(df["U:0"].to_numpy(), dtype=np.float32, copy=True),
                         "v": np.array(df["U:1"].to_numpy(), dtype=np.float32, copy=True),
-                        "p": p_residual - p_gauge,
                     }
                 )
             )
 
         uvp_df = pd.concat(frames, ignore_index=True)
         self.xyt = np.array(uvp_df[["x", "y", "t"]].to_numpy(), dtype=np.float32, copy=True)
-        self.uvp = np.array(uvp_df[["u", "v", "p"]].to_numpy(), dtype=np.float32, copy=True)
+        self.uv = np.array(uvp_df[["u", "v"]].to_numpy(), dtype=np.float32, copy=True)
 
     def __len__(self) -> int:
         return self.xyt.shape[0]
 
     def __getitem__(self, idx: int):
-        return self.xyt[idx].copy(), self.uvp[idx].copy()
+        return self.xyt[idx].copy(), self.uv[idx].copy()
 
 
 class AdaptiveSwish(nn.Module):
@@ -217,18 +206,6 @@ class AdaptiveSwish(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sigmoid(self.beta * x)
-
-
-def fit_linear_pressure_background(y: np.ndarray, p: np.ndarray) -> np.ndarray:
-    """
-    Fit a simple affine background p_bg(y) = a + b*y and return it at each y.
-    This lets the model focus on the pressure residual instead of spending
-    capacity on the dominant hydrostatic-like vertical trend.
-    """
-    y64 = np.asarray(y, dtype=np.float64).reshape(-1)
-    p64 = np.asarray(p, dtype=np.float64).reshape(-1)
-    a, b = np.polyfit(y64, p64, deg=1)
-    return (a * y64 + b).astype(np.float32)
 
 
 def make_activation(name: str) -> nn.Module:
@@ -250,7 +227,7 @@ class MLP(nn.Module):
     def __init__(
         self,
         in_dim: int = 3,
-        out_dim: int = 4,
+        out_dim: int = 3,
         hidden: int = 64,
         depth: int = 4,
         activation: str = "tanh",
@@ -298,7 +275,7 @@ class TwoHeadMLP(nn.Module):
         self.flow_head = nn.Sequential(
             nn.Linear(hidden, hidden),
             make_activation(activation),
-            nn.Linear(hidden, 3),
+            nn.Linear(hidden, 2),
         )
         self._init()
 
@@ -323,7 +300,7 @@ class PinnWorkflow:
         os.makedirs(os.path.dirname(cfg.pretrain_ckpt_path) or ".", exist_ok=True)
         self.data_ds = DataPoints(cfg.data_csv)
         self.phys_ds = PhysicsPoints(cfg.phys_csv)
-        self.uvp_ds = UVPPoints(cfg.eval_glob, cfg.p_gauge_x, cfg.p_gauge_y)
+        self.uvp_ds = UVPPoints(cfg.eval_glob)
         self.data_loader = self._make_loader(self.data_ds, cfg.batch_data)
         self.phys_loader = self._make_loader(self.phys_ds, cfg.batch_phys)
         self.uvp_loader = self._make_loader(self.uvp_ds, cfg.batch_uvp)
@@ -378,11 +355,26 @@ class PinnWorkflow:
     def load_checkpoint_weights(self, model: nn.Module, ckpt_path: str) -> nn.Module:
         state = torch.load(ckpt_path, map_location=self.cfg.device)
         if isinstance(state, dict) and "model_state_dict" in state:
-            model.load_state_dict(state["model_state_dict"])
+            state_dict = state["model_state_dict"]
         elif isinstance(state, dict):
-            model.load_state_dict(state)
+            state_dict = state
         else:
             raise ValueError(f"Unexpected checkpoint format: {ckpt_path}")
+        model_state = model.state_dict()
+        compatible = {
+            key: value
+            for key, value in state_dict.items()
+            if key in model_state and model_state[key].shape == value.shape
+        }
+        missing_or_mismatched = sorted(set(model_state) - set(compatible))
+        model.load_state_dict(compatible, strict=False)
+        if missing_or_mismatched:
+            preview = ", ".join(missing_or_mismatched[:6])
+            suffix = " ..." if len(missing_or_mismatched) > 6 else ""
+            print(
+                f"Loaded compatible weights from {ckpt_path}; "
+                f"skipped {len(missing_or_mismatched)} keys: {preview}{suffix}"
+            )
         return model
 
     def normalize_xyt(self, xyt: torch.Tensor) -> torch.Tensor:
@@ -409,7 +401,6 @@ class PinnWorkflow:
             inputs,
             grad_outputs=torch.ones_like(outputs),
             create_graph=True,
-            retain_graph=True,
             only_inputs=True,
         )[0]
 
@@ -418,8 +409,7 @@ class PinnWorkflow:
         out = model(xyt_norm)
         u_raw = out[:, 0:1]
         v_raw = out[:, 1:2]
-        p = out[:, 2:3]
-        alpha = out[:, 3:4]
+        alpha = out[:, 2:3]
 
         x = xyt[:, 0:1]
         y = xyt[:, 1:2]
@@ -428,71 +418,57 @@ class PinnWorkflow:
 
         u = l_u * u_raw
         v = l_v * v_raw
-        return u, v, p, alpha
+        return u, v, alpha
 
-    def uvp_supervision_loss(self, model: nn.Module, xyt: torch.Tensor, uvp_true: torch.Tensor):
-        u_pred, v_pred, p_pred, _ = self.model_fields(model, xyt)
-        u_true = uvp_true[:, 0:1]
-        v_true = uvp_true[:, 1:2]
-        p_true = uvp_true[:, 2:3]
+    def uv_supervision_loss(self, model: nn.Module, xyt: torch.Tensor, uv_true: torch.Tensor):
+        u_pred, v_pred, _ = self.model_fields(model, xyt)
+        u_true = uv_true[:, 0:1]
+        v_true = uv_true[:, 1:2]
 
         u_pred_nd = u_pred / self.cfg.u_ref
         v_pred_nd = v_pred / self.cfg.u_ref
-        p_pred_nd = p_pred / self.cfg.p_ref
 
         u_true_nd = u_true / self.cfg.u_ref
         v_true_nd = v_true / self.cfg.u_ref
-        p_true_nd = p_true / self.cfg.p_ref
 
         l_u = torch.mean((u_pred_nd - u_true_nd) ** 2)
         l_v = torch.mean((v_pred_nd - v_true_nd) ** 2)
-        l_p = torch.mean((p_pred_nd - p_true_nd) ** 2)
-        return l_u, l_v, l_p
+        return l_u, l_v
 
-    def weighted_uvp_supervision_loss(self, model: nn.Module, xyt: torch.Tensor, uvp_true: torch.Tensor):
-        l_u, l_v, l_p = self.uvp_supervision_loss(model, xyt, uvp_true)
-        loss_uvp = (
+    def weighted_uv_supervision_loss(self, model: nn.Module, xyt: torch.Tensor, uv_true: torch.Tensor):
+        l_u, l_v = self.uv_supervision_loss(model, xyt, uv_true)
+        loss_uv = (
             self.cfg.lambda_u_supervised * l_u
             + self.cfg.lambda_v_supervised * l_v
-            + self.cfg.lambda_p_supervised * l_p
         )
-        return loss_uvp, l_u, l_v, l_p
-
-    def pressure_gauge_loss(self, model: nn.Module) -> torch.Tensor:
-        gauge_point = torch.tensor(
-            [[self.cfg.p_gauge_x, self.cfg.p_gauge_y, self.cfg.p_gauge_t]],
-            device=self.cfg.device,
-            dtype=self.cfg.dtype,
-        )
-        _, _, p_anchor, _ = self.model_fields(model, gauge_point)
-        return torch.mean((p_anchor / self.cfg.p_ref) ** 2)
+        return loss_uv, l_u, l_v
 
     def get_phys_weights(self, epoch: int):
         if epoch <= 50:
-            return 1.0, 0.5, 0.1, 0.0, 0.02
+            return 1.0, 0.5, 0.1, 0.02
         if epoch <= 150:
-            return 1.0, 0.7, 0.3, 0.0, 0.05
+            return 1.0, 0.7, 0.3, 0.05
         if epoch <= 300:
-            return 1.0, 1.0, 0.7, 0.0, 0.10
+            return 1.0, 1.0, 0.7, 0.10
         if epoch <= 500:
-            return 1.0, 1.0, 1.0, 0.02, 0.15
-        return 1.0, 1.0, 1.2, 0.05, 0.20
+            return 1.0, 1.0, 1.0, 0.15
+        return 1.0, 1.0, 1.2, 0.20
 
     def get_flow_stage_weights(self, epoch: int):
         if epoch <= 50:
-            return 1.0, 0.3, 1.0, 0.03
+            return 1.0, 0.3, 0.03
         if epoch <= 100:
-            return 1.0, 0.3, 1.5, 0.05
-        return 1.0, 0.2, 2.0, 0.08
+            return 1.0, 0.3, 0.05
+        return 1.0, 0.2, 0.08
 
     def get_joint_finetune_weights(self, epoch: int):
         if epoch <= 25:
-            return 1.0, 0.2, 0.2, 0.0, 0.01
+            return 1.0, 0.2, 0.2, 0.01
         if epoch <= 50:
-            return 1.0, 0.3, 0.3, 0.0, 0.02
+            return 1.0, 0.3, 0.3, 0.02
         if epoch <= 75:
-            return 1.0, 0.4, 0.5, 0.0, 0.03
-        return 1.0, 0.5, 0.7, 0.01, 0.05
+            return 1.0, 0.4, 0.5, 0.03
+        return 1.0, 0.5, 0.7, 0.05
 
     def get_s_full(self, epoch: int) -> float:
         if self.cfg.s_full_ramp_epochs <= 0:
@@ -502,7 +478,7 @@ class PinnWorkflow:
 
     def residuals(self, model: nn.Module, xyt: torch.Tensor, s_val: float):
         xyt = xyt.requires_grad_(True)
-        u, v, p, alpha = self.model_fields(model, xyt)
+        u, v, alpha = self.model_fields(model, xyt)
 
         phi = torch.tanh(float(s_val) * alpha)
         delta = 1.0 - phi**2
@@ -511,12 +487,10 @@ class PinnWorkflow:
 
         u_grad = self.grad(u, xyt)
         v_grad = self.grad(v, xyt)
-        p_grad = self.grad(p, xyt)
         a_grad = self.grad(alpha, xyt)
 
         u_x, u_y, u_t = u_grad[:, 0:1], u_grad[:, 1:2], u_grad[:, 2:3]
         v_x, v_y, v_t = v_grad[:, 0:1], v_grad[:, 1:2], v_grad[:, 2:3]
-        p_x, p_y = p_grad[:, 0:1], p_grad[:, 1:2]
         a_x, a_y, a_t = a_grad[:, 0:1], a_grad[:, 1:2], a_grad[:, 2:3]
 
         r_div = u_x + v_y
@@ -545,53 +519,19 @@ class PinnWorkflow:
         v_x_nd = (self.cfg.l_ref / self.cfg.u_ref) * v_x
         v_y_nd = (self.cfg.l_ref / self.cfg.u_ref) * v_y
         v_t_nd = (self.cfg.t_ref / self.cfg.u_ref) * v_t
-        p_x_nd = (self.cfg.l_ref / self.cfg.p_ref) * p_x
-        p_y_nd = (self.cfg.l_ref / self.cfg.p_ref) * p_y
-
-        dxx_nd = u_x_nd
-        dyy_nd = v_y_nd
-        dxy_nd = 0.5 * (u_y_nd + v_x_nd)
-
-        term_xx_nd = 2.0 * mu_nd * dxx_nd
-        term_xy_nd = 2.0 * mu_nd * dxy_nd
-        term_yy_nd = 2.0 * mu_nd * dyy_nd
-
-        term_xx_nd_grad = self.grad(term_xx_nd, xyt)
-        term_xy_nd_grad = self.grad(term_xy_nd, xyt)
-        term_yy_nd_grad = self.grad(term_yy_nd, xyt)
-
-        visc_x_nd = self.cfg.l_ref * term_xx_nd_grad[:, 0:1] + self.cfg.l_ref * term_xy_nd_grad[:, 1:2]
-        visc_y_nd = self.cfg.l_ref * term_xy_nd_grad[:, 0:1] + self.cfg.l_ref * term_yy_nd_grad[:, 1:2]
-
         adv_u_nd = u_t_nd + u_nd * u_x_nd + v_nd * u_y_nd
         adv_v_nd = v_t_nd + u_nd * v_x_nd + v_nd * v_y_nd
-
-        r_mom_u = (
-            rho_nd * adv_u_nd
-            + p_x_nd
-            - (1.0 / self.cfg.re_ref) * visc_x_nd
-            - rho_nd * self.cfg.g_x_ref
-            - f_st_x_nd
-        )
-        r_mom_v = (
-            rho_nd * adv_v_nd
-            + p_y_nd
-            - (1.0 / self.cfg.re_ref) * visc_y_nd
-            - rho_nd * self.cfg.g_y_ref
-            - f_st_y_nd
-        )
+        r_flow_adv = rho_nd * (adv_u_nd**2 + adv_v_nd**2) + f_st_x_nd**2 + f_st_y_nd**2
 
         return {
             "r_div": r_div,
             "r_adv": r_adv,
             "r_eik": r_eik,
-            "r_mom_u": r_mom_u,
-            "r_mom_v": r_mom_v,
+            "r_flow_adv": r_flow_adv,
             "phi": phi,
             "alpha": alpha,
             "u": u,
             "v": v,
-            "p": p,
             "rho_nd": rho_nd,
             "mu_nd": mu_nd,
         }
@@ -601,6 +541,18 @@ class PinnWorkflow:
         return {"epoch": [], "loss": [], "loss_data": [], "s": []}
 
     @staticmethod
+    def make_supervised_warmup_history() -> dict:
+        return {
+            "epoch": [],
+            "loss": [],
+            "loss_data": [],
+            "loss_uvp": [],
+            "L_u": [],
+            "L_v": [],
+            "s": [],
+        }
+
+    @staticmethod
     def make_full_history() -> dict:
         return {
             "epoch": [],
@@ -608,18 +560,14 @@ class PinnWorkflow:
             "loss_data": [],
             "loss_phys": [],
             "loss_uvp": [],
-            "loss_gauge": [],
             "s": [],
             "L_u": [],
             "L_v": [],
-            "L_p": [],
             "L_div": [],
             "L_adv": [],
-            "L_mom": [],
             "L_eik": [],
             "ema_div": [],
             "ema_adv": [],
-            "ema_mom": [],
             "ema_eik": [],
         }
 
@@ -630,17 +578,13 @@ class PinnWorkflow:
             "loss": [],
             "loss_uvp": [],
             "loss_phys": [],
-            "loss_gauge": [],
             "L_u": [],
             "L_v": [],
-            "L_p": [],
             "L_div": [],
             "L_adv": [],
-            "L_mom": [],
             "L_eik": [],
             "ema_div": [],
             "ema_adv": [],
-            "ema_mom": [],
             "ema_eik": [],
             "s": [],
         }
@@ -653,7 +597,6 @@ class PinnWorkflow:
             "loss_uvp": [],
             "L_u": [],
             "L_v": [],
-            "L_p": [],
         }
 
     @staticmethod
@@ -664,18 +607,14 @@ class PinnWorkflow:
             "loss_data": [],
             "loss_uvp": [],
             "loss_phys": [],
-            "loss_gauge": [],
             "s": [],
             "L_u": [],
             "L_v": [],
-            "L_p": [],
             "L_div": [],
             "L_adv": [],
-            "L_mom": [],
             "L_eik": [],
             "ema_div": [],
             "ema_adv": [],
-            "ema_mom": [],
             "ema_eik": [],
         }
 
@@ -793,6 +732,49 @@ class PinnWorkflow:
         )
         print(f"Saved flow-supervised weights: {weights_path}")
 
+    def save_warmup_state(
+        self,
+        model: nn.Module,
+        opt: torch.optim.Optimizer,
+        history: dict,
+        epoch: int,
+        save_periodic: bool = False,
+    ) -> None:
+        os.makedirs(self.cfg.warmup_state_dir, exist_ok=True)
+        state = {
+            "epoch": epoch,
+            "stage": "supervised_warmup",
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": opt.state_dict(),
+            "history": history,
+        }
+
+        torch.save(state, self.cfg.warmup_latest_state_path)
+        with open(self.cfg.warmup_latest_history_path, "w", encoding="utf-8") as fh:
+            json.dump(history, fh, ensure_ascii=False, indent=2)
+
+        if save_periodic:
+            state_path = f"{self.cfg.warmup_state_dir}/warmup_epoch_{epoch:04d}.pt"
+            history_path = f"{self.cfg.warmup_state_dir}/warmup_epoch_{epoch:04d}_history.json"
+            torch.save(state, state_path)
+            with open(history_path, "w", encoding="utf-8") as fh:
+                json.dump(history, fh, ensure_ascii=False, indent=2)
+            print(f"Saved warmup state: {state_path}")
+            print(f"Saved warmup history: {history_path}")
+
+    def save_warmup_weights(self, model: nn.Module, epoch: int) -> None:
+        os.makedirs(self.cfg.warmup_weights_dir, exist_ok=True)
+        weights_path = f"{self.cfg.warmup_weights_dir}/model_warmup_epoch_{epoch:04d}.pt"
+        torch.save(
+            {
+                "epoch": epoch,
+                "stage": "supervised_warmup",
+                "model_state_dict": model.state_dict(),
+            },
+            weights_path,
+        )
+        print(f"Saved warmup weights: {weights_path}")
+
     def save_full_training_state(
         self,
         model: nn.Module,
@@ -832,7 +814,7 @@ class PinnWorkflow:
         model.load_state_dict(state["model_state_dict"])
         opt.load_state_dict(state["optimizer_state_dict"])
         history = state.get("history", self.make_full_history())
-        ema = state.get("ema", {"div": None, "adv": None, "mom": None, "eik": None})
+        ema = state.get("ema", {"div": None, "adv": None, "eik": None})
         ema_steps = state.get("ema_steps", 0)
         start_epoch = int(state.get("epoch", 0)) + 1
         return model, opt, history, ema, ema_steps, start_epoch
@@ -857,7 +839,7 @@ class PinnWorkflow:
                     xyt_d = xyt_d_np.to(self.cfg.device, dtype=self.cfg.dtype)
                     phi_true = phi_np.to(self.cfg.device, dtype=self.cfg.dtype)
 
-                    _, _, _, alpha_d = self.model_fields(model, xyt_d)
+                    _, _, alpha_d = self.model_fields(model, xyt_d)
                     phi_pred = torch.tanh(s_pretrain_tensor * alpha_d)
                     loss_data = torch.mean((phi_pred - phi_true) ** 2)
                     loss = self.cfg.lambda_data_pretrain * loss_data
@@ -886,6 +868,117 @@ class PinnWorkflow:
         self.save_checkpoint(model, self.cfg.pretrain_ckpt_path, epochs, stage="pretrain")
         return history
 
+    def train_supervised_warmup_stage(
+        self,
+        model: nn.Module,
+        opt: torch.optim.Optimizer,
+        epochs: int,
+        start_epoch: int = 1,
+        history: dict | None = None,
+    ):
+        history = self.make_supervised_warmup_history() if history is None else history
+        self.unfreeze_all(model)
+        s_pretrain_tensor = torch.tensor(self.cfg.s_pretrain, device=self.cfg.device, dtype=self.cfg.dtype)
+
+        n_steps = max(len(self.data_loader), len(self.uvp_loader))
+        last_completed_epoch = history["epoch"][-1] if history["epoch"] else (start_epoch - 1)
+
+        try:
+            for epoch in range(start_epoch, epochs + 1):
+                model.train()
+                running = {
+                    "loss": 0.0,
+                    "loss_data": 0.0,
+                    "loss_uvp": 0.0,
+                    "L_u": 0.0,
+                    "L_v": 0.0,
+                }
+
+                data_iter = cycle(self.data_loader)
+                uvp_iter = cycle(self.uvp_loader)
+
+                with tqdm(
+                    range(n_steps),
+                    desc=f"Supervised warmup {epoch}/{epochs}",
+                    total=n_steps,
+                    dynamic_ncols=True,
+                    leave=False,
+                ) as pbar:
+                    for _ in pbar:
+                        xyt_d_np, phi_np = next(data_iter)
+                        xyt_uv_np, uv_np = next(uvp_iter)
+
+                        xyt_d = xyt_d_np.to(self.cfg.device, dtype=self.cfg.dtype)
+                        phi_true = phi_np.to(self.cfg.device, dtype=self.cfg.dtype)
+                        xyt_uv = xyt_uv_np.to(self.cfg.device, dtype=self.cfg.dtype)
+                        uv_true = uv_np.to(self.cfg.device, dtype=self.cfg.dtype)
+
+                        _, _, alpha_d = self.model_fields(model, xyt_d)
+                        phi_pred = torch.tanh(s_pretrain_tensor * alpha_d)
+                        loss_data = torch.mean((phi_pred - phi_true) ** 2)
+
+                        loss_uv, l_u, l_v = self.weighted_uv_supervision_loss(model, xyt_uv, uv_true)
+                        loss = self.cfg.lambda_data_pretrain * loss_data + self.cfg.lambda_uvp_full * loss_uv
+
+                        opt.zero_grad(set_to_none=True)
+                        loss.backward()
+                        opt.step()
+
+                        running["loss"] += float(loss.item())
+                        running["loss_data"] += float(loss_data.item())
+                        running["loss_uvp"] += float(loss_uv.item())
+                        running["L_u"] += float(l_u.item())
+                        running["L_v"] += float(l_v.item())
+
+                        pbar.set_postfix(
+                            loss=f"{loss.item():.4e}",
+                            loss_data=f"{loss_data.item():.2e}",
+                            loss_uv=f"{loss_uv.item():.2e}",
+                            u=f"{l_u.item():.2e}",
+                            v=f"{l_v.item():.2e}",
+                        )
+
+                history["epoch"].append(epoch)
+                history["loss"].append(running["loss"] / n_steps)
+                history["loss_data"].append(running["loss_data"] / n_steps)
+                history["loss_uvp"].append(running["loss_uvp"] / n_steps)
+                history["L_u"].append(running["L_u"] / n_steps)
+                history["L_v"].append(running["L_v"] / n_steps)
+                history["s"].append(self.cfg.s_pretrain)
+                last_completed_epoch = epoch
+
+                self.save_warmup_state(
+                    model,
+                    opt,
+                    history,
+                    epoch,
+                    save_periodic=(epoch % self.cfg.warmup_save_every == 0),
+                )
+                if epoch % self.cfg.warmup_save_every == 0:
+                    self.save_warmup_weights(model, epoch)
+
+                if epoch % 25 == 0 or epoch == start_epoch:
+                    print(
+                        f"warmup_epoch={epoch:5d} "
+                        f"loss={history['loss'][-1]:.4e} "
+                        f"loss_data={history['loss_data'][-1]:.4e} "
+                        f"loss_uvp={history['loss_uvp'][-1]:.4e} "
+                        f"L_u={history['L_u'][-1]:.4e} "
+                        f"L_v={history['L_v'][-1]:.4e}"
+                    )
+        finally:
+            if last_completed_epoch >= start_epoch:
+                self.save_warmup_state(
+                    model,
+                    opt,
+                    history,
+                    last_completed_epoch,
+                    save_periodic=False,
+                )
+
+        self.save_checkpoint(model, self.cfg.pretrain_ckpt_path, last_completed_epoch, stage="supervised_warmup")
+        return history
+
     def train_full(
         self,
         model: nn.Module,
@@ -897,7 +990,7 @@ class PinnWorkflow:
         ema_steps: int = 0,
     ):
         history = self.make_full_history() if history is None else history
-        ema = {"div": None, "adv": None, "mom": None, "eik": None} if ema is None else ema
+        ema = {"div": None, "adv": None, "eik": None} if ema is None else ema
 
         def ema_update(key: str, value: torch.Tensor) -> None:
             nonlocal ema_steps
@@ -923,8 +1016,8 @@ class PinnWorkflow:
                 s_full = self.get_s_full(epoch)
                 s_full_tensor = torch.tensor(s_full, device=self.cfg.device, dtype=self.cfg.dtype)
                 running = {k: 0.0 for k in [
-                    "loss", "loss_data", "loss_phys", "loss_uvp", "loss_gauge",
-                    "L_u", "L_v", "L_p", "L_div", "L_adv", "L_mom", "L_eik"
+                    "loss", "loss_data", "loss_phys", "loss_uvp",
+                    "L_u", "L_v", "L_div", "L_adv", "L_eik"
                 ]}
 
                 data_iter = cycle(self.data_loader)
@@ -949,37 +1042,32 @@ class PinnWorkflow:
                         xyt_uvp = xyt_uvp_np.to(self.cfg.device, dtype=self.cfg.dtype)
                         uvp_true = uvp_np.to(self.cfg.device, dtype=self.cfg.dtype)
 
-                        _, _, _, alpha_d = self.model_fields(model, xyt_d)
+                        _, _, alpha_d = self.model_fields(model, xyt_d)
                         phi_pred = torch.tanh(s_full_tensor * alpha_d)
                         loss_data = torch.mean((phi_pred - phi_true) ** 2)
 
-                        loss_uvp, l_u, l_v, l_p = self.weighted_uvp_supervision_loss(model, xyt_uvp, uvp_true)
+                        loss_uv, l_u, l_v = self.weighted_uv_supervision_loss(model, xyt_uvp, uvp_true)
 
                         res = self.residuals(model, xyt_p, s_val=s_full)
                         l_div = torch.mean(res["r_div"] ** 2)
                         l_adv = torch.mean(res["r_adv"] ** 2)
                         l_eik = torch.mean(res["r_eik"] ** 2)
-                        l_mom = torch.mean(res["r_mom_u"] ** 2) + torch.mean(res["r_mom_v"] ** 2)
-                        loss_gauge = self.pressure_gauge_loss(model)
 
                         ema_update("div", l_div)
                         ema_update("adv", l_adv)
-                        ema_update("mom", l_mom)
                         ema_update("eik", l_eik)
                         ema_steps += 1
 
                         l_div_n = l_div / ema_scale("div")
                         l_adv_n = l_adv / ema_scale("adv")
-                        l_mom_n = l_mom / ema_scale("mom")
                         l_eik_n = l_eik / ema_scale("eik")
 
-                        w_div, w_adv, w_mom, w_eik, lam_phys = self.get_phys_weights(epoch)
-                        loss_phys = w_div * l_div_n + w_adv * l_adv_n + w_mom * l_mom_n + w_eik * l_eik_n
+                        w_div, w_adv, w_eik, lam_phys = self.get_phys_weights(epoch)
+                        loss_phys = w_div * l_div_n + w_adv * l_adv_n + w_eik * l_eik_n
                         loss = (
                             self.cfg.lambda_data_full * loss_data
-                            + self.cfg.lambda_uvp_full * loss_uvp
+                            + self.cfg.lambda_uvp_full * loss_uv
                             + lam_phys * loss_phys
-                            + self.cfg.lambda_pressure_gauge * loss_gauge
                         )
 
                         opt.zero_grad(set_to_none=True)
@@ -989,27 +1077,21 @@ class PinnWorkflow:
                         running["loss"] += float(loss.item())
                         running["loss_data"] += float(loss_data.item())
                         running["loss_phys"] += float(loss_phys.item())
-                        running["loss_uvp"] += float(loss_uvp.item())
-                        running["loss_gauge"] += float(loss_gauge.item())
+                        running["loss_uvp"] += float(loss_uv.item())
                         running["L_u"] += float(l_u.item())
                         running["L_v"] += float(l_v.item())
-                        running["L_p"] += float(l_p.item())
                         running["L_div"] += float(l_div.item())
                         running["L_adv"] += float(l_adv.item())
-                        running["L_mom"] += float(l_mom.item())
                         running["L_eik"] += float(l_eik.item())
 
                         pbar.set_postfix(
                             loss=f"{loss.item():.4e}",
                             loss_data=f"{loss_data.item():.4e}",
-                            loss_uvp=f"{loss_uvp.item():.2e}",
-                            loss_gauge=f"{loss_gauge.item():.2e}",
+                            loss_uv=f"{loss_uv.item():.2e}",
                             s=f"{s_full:.1f}",
                             lambda_phys=f"{lam_phys:.2e}",
-                            mom=f"{l_mom.item():.2e}",
                             u=f"{l_u.item():.2e}",
                             v=f"{l_v.item():.2e}",
-                            p=f"{l_p.item():.2e}",
                         )
 
                 history["epoch"].append(epoch)
@@ -1017,18 +1099,14 @@ class PinnWorkflow:
                 history["loss_data"].append(running["loss_data"] / n_steps)
                 history["loss_phys"].append(running["loss_phys"] / n_steps)
                 history["loss_uvp"].append(running["loss_uvp"] / n_steps)
-                history["loss_gauge"].append(running["loss_gauge"] / n_steps)
                 history["s"].append(s_full)
                 history["L_u"].append(running["L_u"] / n_steps)
                 history["L_v"].append(running["L_v"] / n_steps)
-                history["L_p"].append(running["L_p"] / n_steps)
                 history["L_div"].append(running["L_div"] / n_steps)
                 history["L_adv"].append(running["L_adv"] / n_steps)
-                history["L_mom"].append(running["L_mom"] / n_steps)
                 history["L_eik"].append(running["L_eik"] / n_steps)
                 history["ema_div"].append(float(ema["div"].item()))
                 history["ema_adv"].append(float(ema["adv"].item()))
-                history["ema_mom"].append(float(ema["mom"].item()))
                 history["ema_eik"].append(float(ema["eik"].item()))
                 last_completed_epoch = epoch
 
@@ -1052,14 +1130,11 @@ class PinnWorkflow:
                         f"loss_data={history['loss_data'][-1]:.4e} "
                         f"loss_uvp={history['loss_uvp'][-1]:.4e} "
                         f"loss_phys={history['loss_phys'][-1]:.4e} "
-                        f"loss_gauge={history['loss_gauge'][-1]:.4e} "
-                        f"lambda_phys={self.get_phys_weights(epoch)[4]:.2e} "
+                        f"lambda_phys={self.get_phys_weights(epoch)[3]:.2e} "
                         f"L_u={history['L_u'][-1]:.4e} "
                         f"L_v={history['L_v'][-1]:.4e} "
-                        f"L_p={history['L_p'][-1]:.4e} "
                         f"L_div={history['L_div'][-1]:.4e} "
                         f"L_adv={history['L_adv'][-1]:.4e} "
-                        f"L_mom={history['L_mom'][-1]:.4e} "
                         f"L_eik={history['L_eik'][-1]:.4e}"
                     )
         finally:
@@ -1088,7 +1163,7 @@ class PinnWorkflow:
         ema_steps: int = 0,
     ):
         history = self.make_flow_history() if history is None else history
-        ema = {"div": None, "adv": None, "mom": None, "eik": None} if ema is None else ema
+        ema = {"div": None, "adv": None, "eik": None} if ema is None else ema
 
         def ema_update(key: str, value: torch.Tensor) -> None:
             nonlocal ema_steps
@@ -1114,8 +1189,8 @@ class PinnWorkflow:
                 model.train()
                 s_full = self.get_s_full(epoch)
                 running = {k: 0.0 for k in [
-                    "loss", "loss_uvp", "loss_phys", "loss_gauge",
-                    "L_u", "L_v", "L_p", "L_div", "L_adv", "L_mom", "L_eik"
+                    "loss", "loss_uvp", "loss_phys",
+                    "L_u", "L_v", "L_div", "L_adv", "L_eik"
                 ]}
 
                 phys_iter = cycle(self.phys_loader)
@@ -1136,73 +1211,58 @@ class PinnWorkflow:
                         xyt_uvp = xyt_uvp_np.to(self.cfg.device, dtype=self.cfg.dtype)
                         uvp_true = uvp_np.to(self.cfg.device, dtype=self.cfg.dtype)
 
-                        loss_uvp, l_u, l_v, l_p = self.weighted_uvp_supervision_loss(model, xyt_uvp, uvp_true)
+                        loss_uv, l_u, l_v = self.weighted_uv_supervision_loss(model, xyt_uvp, uvp_true)
 
                         res = self.residuals(model, xyt_p, s_val=s_full)
                         l_div = torch.mean(res["r_div"] ** 2)
                         l_adv = torch.mean(res["r_adv"] ** 2)
                         l_eik = torch.mean(res["r_eik"] ** 2)
-                        l_mom = torch.mean(res["r_mom_u"] ** 2) + torch.mean(res["r_mom_v"] ** 2)
-                        loss_gauge = self.pressure_gauge_loss(model)
 
                         ema_update("div", l_div)
                         ema_update("adv", l_adv)
-                        ema_update("mom", l_mom)
                         ema_update("eik", l_eik)
                         ema_steps += 1
 
                         l_div_n = l_div / ema_scale("div")
                         l_adv_n = l_adv / ema_scale("adv")
-                        l_mom_n = l_mom / ema_scale("mom")
-                        l_eik_n = l_eik / ema_scale("eik")
 
-                        w_div, w_adv, w_mom, lam_phys = self.get_flow_stage_weights(epoch)
-                        loss_phys = w_div * l_div_n + w_adv * l_adv_n + w_mom * l_mom_n
-                        loss = self.cfg.lambda_uvp_full * loss_uvp + lam_phys * loss_phys + self.cfg.lambda_pressure_gauge * loss_gauge
+                        w_div, w_adv, lam_phys = self.get_flow_stage_weights(epoch)
+                        loss_phys = w_div * l_div_n + w_adv * l_adv_n
+                        loss = self.cfg.lambda_uvp_full * loss_uv + lam_phys * loss_phys
 
                         opt.zero_grad(set_to_none=True)
                         loss.backward()
                         opt.step()
 
                         running["loss"] += float(loss.item())
-                        running["loss_uvp"] += float(loss_uvp.item())
+                        running["loss_uvp"] += float(loss_uv.item())
                         running["loss_phys"] += float(loss_phys.item())
-                        running["loss_gauge"] += float(loss_gauge.item())
                         running["L_u"] += float(l_u.item())
                         running["L_v"] += float(l_v.item())
-                        running["L_p"] += float(l_p.item())
                         running["L_div"] += float(l_div.item())
                         running["L_adv"] += float(l_adv.item())
-                        running["L_mom"] += float(l_mom.item())
                         running["L_eik"] += float(l_eik.item())
 
                         pbar.set_postfix(
                             loss=f"{loss.item():.4e}",
-                            loss_uvp=f"{loss_uvp.item():.2e}",
-                            loss_gauge=f"{loss_gauge.item():.2e}",
+                            loss_uv=f"{loss_uv.item():.2e}",
                             s=f"{s_full:.1f}",
                             lambda_phys=f"{lam_phys:.2e}",
-                            mom=f"{l_mom.item():.2e}",
                             u=f"{l_u.item():.2e}",
                             v=f"{l_v.item():.2e}",
-                            p=f"{l_p.item():.2e}",
                         )
 
                 history["epoch"].append(epoch)
                 history["loss"].append(running["loss"] / n_steps)
                 history["loss_uvp"].append(running["loss_uvp"] / n_steps)
                 history["loss_phys"].append(running["loss_phys"] / n_steps)
-                history["loss_gauge"].append(running["loss_gauge"] / n_steps)
                 history["L_u"].append(running["L_u"] / n_steps)
                 history["L_v"].append(running["L_v"] / n_steps)
-                history["L_p"].append(running["L_p"] / n_steps)
                 history["L_div"].append(running["L_div"] / n_steps)
                 history["L_adv"].append(running["L_adv"] / n_steps)
-                history["L_mom"].append(running["L_mom"] / n_steps)
                 history["L_eik"].append(running["L_eik"] / n_steps)
                 history["ema_div"].append(float(ema["div"].item()))
                 history["ema_adv"].append(float(ema["adv"].item()))
-                history["ema_mom"].append(float(ema["mom"].item()))
                 history["ema_eik"].append(float(ema["eik"].item()))
                 history["s"].append(s_full)
                 last_completed_epoch = epoch
@@ -1226,14 +1286,11 @@ class PinnWorkflow:
                         f"loss={history['loss'][-1]:.4e} "
                         f"loss_uvp={history['loss_uvp'][-1]:.4e} "
                         f"loss_phys={history['loss_phys'][-1]:.4e} "
-                        f"loss_gauge={history['loss_gauge'][-1]:.4e} "
-                        f"lambda_phys={self.get_flow_stage_weights(epoch)[3]:.2e} "
+                        f"lambda_phys={self.get_flow_stage_weights(epoch)[2]:.2e} "
                         f"L_u={history['L_u'][-1]:.4e} "
                         f"L_v={history['L_v'][-1]:.4e} "
-                        f"L_p={history['L_p'][-1]:.4e} "
                         f"L_div={history['L_div'][-1]:.4e} "
-                        f"L_adv={history['L_adv'][-1]:.4e} "
-                        f"L_mom={history['L_mom'][-1]:.4e}"
+                        f"L_adv={history['L_adv'][-1]:.4e}"
                     )
         finally:
             if last_completed_epoch >= start_epoch:
@@ -1266,7 +1323,7 @@ class PinnWorkflow:
         try:
             for epoch in range(start_epoch, epochs + 1):
                 model.train()
-                running = {"loss": 0.0, "loss_uvp": 0.0, "L_u": 0.0, "L_v": 0.0, "L_p": 0.0}
+                running = {"loss": 0.0, "loss_uvp": 0.0, "L_u": 0.0, "L_v": 0.0}
 
                 with tqdm(
                     self.uvp_loader,
@@ -1279,25 +1336,23 @@ class PinnWorkflow:
                         xyt_uvp = xyt_uvp_np.to(self.cfg.device, dtype=self.cfg.dtype)
                         uvp_true = uvp_np.to(self.cfg.device, dtype=self.cfg.dtype)
 
-                        loss_uvp, l_u, l_v, l_p = self.weighted_uvp_supervision_loss(model, xyt_uvp, uvp_true)
-                        loss = self.cfg.lambda_uvp_full * loss_uvp
+                        loss_uv, l_u, l_v = self.weighted_uv_supervision_loss(model, xyt_uvp, uvp_true)
+                        loss = self.cfg.lambda_uvp_full * loss_uv
 
                         opt.zero_grad(set_to_none=True)
                         loss.backward()
                         opt.step()
 
                         running["loss"] += float(loss.item())
-                        running["loss_uvp"] += float(loss_uvp.item())
+                        running["loss_uvp"] += float(loss_uv.item())
                         running["L_u"] += float(l_u.item())
                         running["L_v"] += float(l_v.item())
-                        running["L_p"] += float(l_p.item())
 
                         pbar.set_postfix(
                             loss=f"{loss.item():.4e}",
-                            loss_uvp=f"{loss_uvp.item():.2e}",
+                            loss_uv=f"{loss_uv.item():.2e}",
                             u=f"{l_u.item():.2e}",
                             v=f"{l_v.item():.2e}",
-                            p=f"{l_p.item():.2e}",
                         )
 
                 history["epoch"].append(epoch)
@@ -1305,7 +1360,6 @@ class PinnWorkflow:
                 history["loss_uvp"].append(running["loss_uvp"] / n_steps)
                 history["L_u"].append(running["L_u"] / n_steps)
                 history["L_v"].append(running["L_v"] / n_steps)
-                history["L_p"].append(running["L_p"] / n_steps)
                 last_completed_epoch = epoch
 
                 self.save_flow_supervised_state(
@@ -1324,8 +1378,7 @@ class PinnWorkflow:
                         f"loss={history['loss'][-1]:.4e} "
                         f"loss_uvp={history['loss_uvp'][-1]:.4e} "
                         f"L_u={history['L_u'][-1]:.4e} "
-                        f"L_v={history['L_v'][-1]:.4e} "
-                        f"L_p={history['L_p'][-1]:.4e}"
+                        f"L_v={history['L_v'][-1]:.4e}"
                     )
         finally:
             if last_completed_epoch >= start_epoch:
@@ -1350,7 +1403,7 @@ class PinnWorkflow:
         ema_steps: int = 0,
     ):
         history = self.make_joint_history() if history is None else history
-        ema = {"div": None, "adv": None, "mom": None, "eik": None} if ema is None else ema
+        ema = {"div": None, "adv": None, "eik": None} if ema is None else ema
         self.unfreeze_all(model)
 
         def ema_update(key: str, value: torch.Tensor) -> None:
@@ -1375,8 +1428,8 @@ class PinnWorkflow:
             s_full = self.get_s_full(epoch)
             s_full_tensor = torch.tensor(s_full, device=self.cfg.device, dtype=self.cfg.dtype)
             running = {k: 0.0 for k in [
-                "loss", "loss_data", "loss_uvp", "loss_phys", "loss_gauge",
-                "L_u", "L_v", "L_p", "L_div", "L_adv", "L_mom", "L_eik"
+                "loss", "loss_data", "loss_uvp", "loss_phys",
+                "L_u", "L_v", "L_div", "L_adv", "L_eik"
             ]}
 
             data_iter = cycle(self.data_loader)
@@ -1401,38 +1454,33 @@ class PinnWorkflow:
                     xyt_uvp = xyt_uvp_np.to(self.cfg.device, dtype=self.cfg.dtype)
                     uvp_true = uvp_np.to(self.cfg.device, dtype=self.cfg.dtype)
 
-                    _, _, _, alpha_d = self.model_fields(model, xyt_d)
+                    _, _, alpha_d = self.model_fields(model, xyt_d)
                     phi_pred = torch.tanh(s_full_tensor * alpha_d)
                     loss_data = torch.mean((phi_pred - phi_true) ** 2)
 
-                    loss_uvp, l_u, l_v, l_p = self.weighted_uvp_supervision_loss(model, xyt_uvp, uvp_true)
+                    loss_uv, l_u, l_v = self.weighted_uv_supervision_loss(model, xyt_uvp, uvp_true)
 
                     res = self.residuals(model, xyt_p, s_val=s_full)
                     l_div = torch.mean(res["r_div"] ** 2)
                     l_adv = torch.mean(res["r_adv"] ** 2)
                     l_eik = torch.mean(res["r_eik"] ** 2)
-                    l_mom = torch.mean(res["r_mom_u"] ** 2) + torch.mean(res["r_mom_v"] ** 2)
-                    loss_gauge = self.pressure_gauge_loss(model)
 
                     ema_update("div", l_div)
                     ema_update("adv", l_adv)
-                    ema_update("mom", l_mom)
                     ema_update("eik", l_eik)
                     ema_steps += 1
 
                     l_div_n = l_div / ema_scale("div")
                     l_adv_n = l_adv / ema_scale("adv")
-                    l_mom_n = l_mom / ema_scale("mom")
                     l_eik_n = l_eik / ema_scale("eik")
 
-                    w_div, w_adv, w_mom, w_eik, lam_phys = self.get_joint_finetune_weights(epoch)
-                    loss_phys = w_div * l_div_n + w_adv * l_adv_n + w_mom * l_mom_n + w_eik * l_eik_n
+                    w_div, w_adv, w_eik, lam_phys = self.get_joint_finetune_weights(epoch)
+                    loss_phys = w_div * l_div_n + w_adv * l_adv_n + w_eik * l_eik_n
 
                     loss = (
                         self.cfg.lambda_data_full * loss_data
-                        + self.cfg.lambda_uvp_full * loss_uvp
+                        + self.cfg.lambda_uvp_full * loss_uv
                         + lam_phys * loss_phys
-                        + self.cfg.lambda_pressure_gauge * loss_gauge
                     )
 
                     opt.zero_grad(set_to_none=True)
@@ -1441,23 +1489,19 @@ class PinnWorkflow:
 
                     running["loss"] += float(loss.item())
                     running["loss_data"] += float(loss_data.item())
-                    running["loss_uvp"] += float(loss_uvp.item())
+                    running["loss_uvp"] += float(loss_uv.item())
                     running["loss_phys"] += float(loss_phys.item())
-                    running["loss_gauge"] += float(loss_gauge.item())
                     running["L_u"] += float(l_u.item())
                     running["L_v"] += float(l_v.item())
-                    running["L_p"] += float(l_p.item())
                     running["L_div"] += float(l_div.item())
                     running["L_adv"] += float(l_adv.item())
-                    running["L_mom"] += float(l_mom.item())
                     running["L_eik"] += float(l_eik.item())
 
                     pbar.set_postfix(
                         loss=f"{loss.item():.4e}",
                         loss_data=f"{loss_data.item():.2e}",
-                        loss_uvp=f"{loss_uvp.item():.2e}",
+                        loss_uv=f"{loss_uv.item():.2e}",
                         lambda_phys=f"{lam_phys:.2e}",
-                        mom=f"{l_mom.item():.2e}",
                     )
 
             history["epoch"].append(epoch)
@@ -1465,17 +1509,13 @@ class PinnWorkflow:
             history["loss_data"].append(running["loss_data"] / n_steps)
             history["loss_uvp"].append(running["loss_uvp"] / n_steps)
             history["loss_phys"].append(running["loss_phys"] / n_steps)
-            history["loss_gauge"].append(running["loss_gauge"] / n_steps)
             history["L_u"].append(running["L_u"] / n_steps)
             history["L_v"].append(running["L_v"] / n_steps)
-            history["L_p"].append(running["L_p"] / n_steps)
             history["L_div"].append(running["L_div"] / n_steps)
             history["L_adv"].append(running["L_adv"] / n_steps)
-            history["L_mom"].append(running["L_mom"] / n_steps)
             history["L_eik"].append(running["L_eik"] / n_steps)
             history["ema_div"].append(float(ema["div"].item()))
             history["ema_adv"].append(float(ema["adv"].item()))
-            history["ema_mom"].append(float(ema["mom"].item()))
             history["ema_eik"].append(float(ema["eik"].item()))
             history["s"].append(s_full)
 
@@ -1487,11 +1527,11 @@ class PinnWorkflow:
                     f"loss_data={history['loss_data'][-1]:.4e} "
                     f"loss_uvp={history['loss_uvp'][-1]:.4e} "
                     f"loss_phys={history['loss_phys'][-1]:.4e} "
-                    f"lambda_phys={self.get_joint_finetune_weights(epoch)[4]:.2e} "
+                    f"lambda_phys={self.get_joint_finetune_weights(epoch)[3]:.2e} "
                     f"L_u={history['L_u'][-1]:.4e} "
                     f"L_v={history['L_v'][-1]:.4e} "
-                    f"L_p={history['L_p'][-1]:.4e} "
-                    f"L_mom={history['L_mom'][-1]:.4e}"
+                    f"L_div={history['L_div'][-1]:.4e} "
+                    f"L_adv={history['L_adv'][-1]:.4e}"
                 )
 
         return history
