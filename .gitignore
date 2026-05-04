@@ -24,7 +24,7 @@ Thumbs.db
 .vscode/
 
 # Local training artifacts and evaluation outputs
-checkpoints/
+
 
 # Local notes
 comands.txt
