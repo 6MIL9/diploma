@@ -87,4 +87,21 @@ def preset_config(name: str) -> TrainingConfig:
             num_batches=20,
             checkpoint_interval=100,
         )
+    if name == "paper_light":
+        return TrainingConfig(
+            hidden_layers=(32,64,128,256,128,64,32),
+            points=PointConfig(
+                alpha=(500, 400),
+                pde=(400, 2000, 3000),
+                north=(20, 20),
+                south=(20, 20),
+                east=(20, 20),
+                west=(20, 20),
+            ),
+            epochs=(5000,) * 5,
+            learning_rates=(1e-4, 5e-5, 1e-5, 5e-6, 1e-6),
+            batch_size=None,
+            num_batches=20,
+            checkpoint_interval=100,
+        )
     raise ValueError(f"Unknown preset '{name}'. Use smoke, default, or paper.")
