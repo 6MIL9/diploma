@@ -27,7 +27,7 @@ class PhysicsConfig:
 
 @dataclass
 class TrainingConfig:
-    data_path: Path = Path("twophasePINN/cfd_data/rising_bubble.h5")
+    data_path: Path = Path("cfd_data/rising_bubble.h5")
     output_dir: Path = Path("diploma/checkpoints")
     hidden_layers: tuple[int, ...] = (128, 128, 128, 128)
     activation: str = "tanh"
@@ -104,4 +104,4 @@ def preset_config(name: str) -> TrainingConfig:
             num_batches=20,
             checkpoint_interval=100,
         )
-    raise ValueError(f"Unknown preset '{name}'. Use smoke, default, or paper.")
+    raise ValueError(f"Unknown preset '{name}'. Use smoke, default, paper_light, or paper.")

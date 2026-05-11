@@ -7,13 +7,17 @@ import numpy as np
 import torch
 
 from .config import PhysicsConfig
+from .data import radius_from_h5_path
 from .model import TwoPhasePINN
 from .visualize import error_metrics, plot_field_comparison, predict_cfd_grid
 
 
-def mesh_inputs(x: np.ndarray, y: np.ndarray, t: np.ndarray) -> torch.Tensor:
+def mesh_inputs(x: np.ndarray, y: np.ndarray, t: np.ndarray, radius: float | None = None) -> torch.Tensor:
     yy, tt, xx = np.meshgrid(y, t, x)
-    return torch.from_numpy(np.stack([xx.ravel(), yy.ravel(), tt.ravel()], axis=1).astype(np.float32))
+    columns = [xx.ravel(), yy.ravel(), tt.ravel()]
+    if radius is not None:
+        columns.append(np.full(xx.size, radius, dtype=np.float64))
+    return torch.from_numpy(np.stack(columns, axis=1).astype(np.float32))
 
 
 def reshape_prediction(values: torch.Tensor, x: np.ndarray, y: np.ndarray, t: np.ndarray) -> np.ndarray:
@@ -24,7 +28,14 @@ def load_model(checkpoint_path: Path, device: torch.device) -> tuple[TwoPhasePIN
     checkpoint = torch.load(checkpoint_path, map_location=device)
     cfg = checkpoint["config"]
     physics = PhysicsConfig(**cfg["physics"])
-    model = TwoPhasePINN(tuple(cfg["hidden_layers"]), physics, cfg.get("activation", "tanh"), tuple(cfg["loss_weights_pde"]))
+    input_dim = int(checkpoint["model_state"]["net.trunk.0.weight"].shape[1])
+    model = TwoPhasePINN(
+        tuple(cfg["hidden_layers"]),
+        physics,
+        cfg.get("activation", "tanh"),
+        tuple(cfg["loss_weights_pde"]),
+        input_dim=input_dim,
+    )
     dtype = torch.float64 if cfg.get("dtype") == "float64" else torch.float32
     model.to(device=device, dtype=dtype)
     model.load_state_dict(checkpoint["model_state"])
@@ -56,6 +67,7 @@ def main() -> None:
     )
     idx = args.time_index
     print(f"Predicted arrays at resolution t={len(coords['t'])}, y={len(coords['y'])}, x={len(coords['x'])}")
+    print(f"Radius: {radius_from_h5_path(args.data_path):.4g}")
     print(f"u range: {pred['u'].min():.4e} .. {pred['u'].max():.4e}")
     print(f"v range: {pred['v'].min():.4e} .. {pred['v'].max():.4e}")
     print(f"p range: {pred['p'].min():.4e} .. {pred['p'].max():.4e}")

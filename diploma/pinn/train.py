@@ -238,7 +238,7 @@ def train(cfg: TrainingConfig) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a PyTorch PINN for the rising bubble case.")
-    parser.add_argument("--preset", choices=["smoke", "default", "paper"], default="default")
+    parser.add_argument("--preset", choices=["smoke", "default", "paper_light", "paper"], default="default")
     parser.add_argument("--data-path", type=Path)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--device", default=None, help="auto, cpu, cuda, cuda:0, ...")

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import math
+import re
+from collections.abc import Sequence
 
 import h5py
 import numpy as np
@@ -246,11 +248,69 @@ def selected_time_indices(n_times: int) -> np.ndarray:
     return np.sort(np.concatenate([indices[0:30:15], indices[30:100:5], indices[100::5], indices[1:3]], axis=0))
 
 
+def resolve_data_paths(data_path: Path | Sequence[Path]) -> list[Path]:
+    if isinstance(data_path, (str, Path)):
+        path = Path(data_path)
+        if path.is_dir():
+            paths = sorted(path.glob("*.h5"))
+            if not paths:
+                raise FileNotFoundError(f"No .h5 files found in directory: {path}")
+            return paths
+        return [path]
+    return [Path(path) for path in data_path]
+
+
+def radius_from_h5_path(data_path: Path, default: float = 0.25) -> float:
+    with h5py.File(data_path, "r") as data:
+        for key in ("radius", "R"):
+            if key in data.attrs:
+                return float(data.attrs[key])
+
+    match = re.search(r"(?:^|[_-])R(\d+(?:\.\d+)?)", data_path.stem, flags=re.IGNORECASE)
+    if match:
+        value = match.group(1)
+        radius = float(value)
+        if radius >= 1.0 and "." not in value:
+            radius /= 100.0
+        return radius
+
+    return default
+
+
+def _append_radius_column(data: np.ndarray, radius: float, target_start: int = 3) -> np.ndarray:
+    radius_col = radius * np.ones((len(data), 1), dtype=data.dtype)
+    return np.hstack([data[:, :target_start], radius_col, data[:, target_start:]])
+
+
+def _concat_training_data(chunks: list[TrainingData]) -> TrainingData:
+    return TrainingData(
+        alpha=torch.cat([chunk.alpha for chunk in chunks], dim=0),
+        pde=torch.cat([chunk.pde for chunk in chunks], dim=0),
+        north=torch.cat([chunk.north for chunk in chunks], dim=0),
+        east_west=torch.cat([chunk.east_west for chunk in chunks], dim=0),
+        nsew=torch.cat([chunk.nsew for chunk in chunks], dim=0),
+    )
+
+
 def make_training_data(
-    data_path: Path,
+    data_path: Path | Sequence[Path],
     cfg: PointConfig,
     l_ref: float,
     seed: int = 1234,
+) -> TrainingData:
+    data_paths = resolve_data_paths(data_path)
+    chunks = [
+        _make_training_data_single(path, cfg, l_ref, seed + index)
+        for index, path in enumerate(data_paths)
+    ]
+    return _concat_training_data(chunks)
+
+
+def _make_training_data_single(
+    data_path: Path,
+    cfg: PointConfig,
+    l_ref: float,
+    seed: int,
 ) -> TrainingData:
     data_path = Path(data_path)
     if not data_path.exists():
@@ -259,6 +319,7 @@ def make_training_data(
         )
 
     rng = np.random.default_rng(seed)
+    radius = radius_from_h5_path(data_path) / l_ref
     with h5py.File(data_path, "r") as data:
         x = np.asarray(data["X"])
         y = np.asarray(data["Y"])
@@ -287,14 +348,26 @@ def make_training_data(
     for arr in (alpha, pde, north, south, east, west, nsew_coords, nsew_for_pde):
         arr[:, :3] /= l_ref
 
-    east_west = np.hstack([east[:, 0:2], west[:, 0:3]])
-    nsew = np.vstack([north[:, 0:5], south, east[: cfg.east[0]], west[: cfg.west[0]]])
+    alpha = _append_radius_column(alpha, radius)
+    pde = _append_radius_column(pde, radius)
+    nsew_for_pde = _append_radius_column(nsew_for_pde, radius)
+
+    east_west = np.hstack(
+        [
+            east[:, 0:3],
+            radius * np.ones((len(east), 1), dtype=east.dtype),
+            west[:, 0:3],
+            radius * np.ones((len(west), 1), dtype=west.dtype),
+        ]
+    )
+    nsew_raw = np.vstack([north[:, 0:5], south, east[: cfg.east[0]], west[: cfg.west[0]]])
+    nsew = _append_radius_column(nsew_raw, radius)
     pde = np.vstack([pde, nsew_for_pde])
 
     return TrainingData(
         alpha=torch.from_numpy(alpha.astype(np.float32)),
         pde=torch.from_numpy(pde.astype(np.float32)),
-        north=torch.from_numpy(north[:, [0, 1, 2, 5]].astype(np.float32)),
+        north=torch.from_numpy(_append_radius_column(north[:, [0, 1, 2, 5]], radius).astype(np.float32)),
         east_west=torch.from_numpy(east_west.astype(np.float32)),
         nsew=torch.from_numpy(nsew.astype(np.float32)),
     )

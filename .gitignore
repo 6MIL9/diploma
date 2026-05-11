@@ -30,4 +30,13 @@ Thumbs.db
 comands.txt
 twophasePINN/
 diploma/checkpoints
+diploma/checkpoints_smoke/
 diploma/cfd_data
+diploma/cfd_basilisk/rising_bubble
+diploma/cfd_basilisk/rising_bubble_*
+diploma/cfd_basilisk/log*.txt
+diploma/cfd_basilisk/snapshot-*.tsv
+diploma/cfd_basilisk/interface-*.dat
+diploma/cfd_basilisk/runs/
+diploma/exp/
+diploma/checkpoints_param_smoke/

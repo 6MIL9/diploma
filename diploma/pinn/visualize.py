@@ -8,7 +8,7 @@ import pandas as pd
 import torch
 
 from .config import PhysicsConfig
-from .data import load_cfd
+from .data import load_cfd, radius_from_h5_path
 from .model import TwoPhasePINN
 
 
@@ -21,9 +21,12 @@ def resolve_device(device: str = "auto") -> torch.device:
     return requested
 
 
-def _mesh_inputs(x: np.ndarray, y: np.ndarray, t: np.ndarray) -> torch.Tensor:
+def _mesh_inputs(x: np.ndarray, y: np.ndarray, t: np.ndarray, radius: float | None = None) -> torch.Tensor:
     tt, yy, xx = np.meshgrid(t, y, x, indexing="ij")
-    return torch.from_numpy(np.stack([xx.ravel(), yy.ravel(), tt.ravel()], axis=1).astype(np.float32))
+    columns = [xx.ravel(), yy.ravel(), tt.ravel()]
+    if radius is not None:
+        columns.append(np.full(xx.size, radius, dtype=np.float64))
+    return torch.from_numpy(np.stack(columns, axis=1).astype(np.float32))
 
 
 def _reshape(values: torch.Tensor, t: np.ndarray, y: np.ndarray, x: np.ndarray) -> np.ndarray:
@@ -38,7 +41,14 @@ def load_model(checkpoint_path: Path, device: torch.device) -> tuple[TwoPhasePIN
     checkpoint = torch.load(checkpoint_path, map_location=device)
     cfg = checkpoint["config"]
     physics = PhysicsConfig(**cfg["physics"])
-    model = TwoPhasePINN(tuple(cfg["hidden_layers"]), physics, cfg.get("activation", "tanh"), tuple(cfg["loss_weights_pde"]))
+    input_dim = int(checkpoint["model_state"]["net.trunk.0.weight"].shape[1])
+    model = TwoPhasePINN(
+        tuple(cfg["hidden_layers"]),
+        physics,
+        cfg.get("activation", "tanh"),
+        tuple(cfg["loss_weights_pde"]),
+        input_dim=input_dim,
+    )
     dtype = torch.float64 if cfg.get("dtype") == "float64" else torch.float32
     model.to(device=device, dtype=dtype)
     model.load_state_dict(checkpoint["model_state"])
@@ -65,7 +75,9 @@ def predict_cfd_grid(
     x = cfd["x"] / physics.l_ref
     y = cfd["y"] / physics.l_ref
     t = cfd["time"] / physics.l_ref
-    xyt = _mesh_inputs(x, y, t).to(device=device_obj, dtype=dtype)
+    radius = radius_from_h5_path(Path(data_path)) / physics.l_ref
+    input_dim = int(model.net.trunk[0].weight.shape[1])
+    xyt = _mesh_inputs(x, y, t, radius if input_dim == 4 else None).to(device=device_obj, dtype=dtype)
 
     with torch.no_grad():
         u, v, p, alpha = model.predict(xyt, batch_size=batch_size)
@@ -87,6 +99,7 @@ def predict_cfd_grid(
         "y": y,
         "t": t,
         "time_raw": cfd["time"],
+        "radius": radius,
         "physics": physics,
         "config": cfg,
     }

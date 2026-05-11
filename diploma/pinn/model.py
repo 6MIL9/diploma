@@ -85,9 +85,10 @@ class TwoPhasePINN(nn.Module):
         physics: PhysicsConfig,
         activation: str = "tanh",
         loss_weights_pde: tuple[float, float, float, float] = (1.0, 10.0, 10.0, 1.0),
+        input_dim: int = 4,
     ):
         super().__init__()
-        self.net = MLP(3, hidden_layers, activation)
+        self.net = MLP(input_dim, hidden_layers, activation)
         self.physics = physics
         self.register_buffer("loss_weights_pde", torch.tensor(loss_weights_pde, dtype=torch.float32))
 
@@ -173,26 +174,26 @@ class TwoPhasePINN(nn.Module):
 
     def loss(self, batches: dict[str, torch.Tensor]) -> LossBreakdown:
         alpha_batch = batches["alpha"]
-        _, _, _, pred_alpha = self.forward(alpha_batch[:, 0:3])
-        loss_alpha = F.mse_loss(pred_alpha, alpha_batch[:, 3:4])
+        _, _, _, pred_alpha = self.forward(alpha_batch[:, 0:4])
+        loss_alpha = F.mse_loss(pred_alpha, alpha_batch[:, 4:5])
 
         north = batches["north"]
-        _, _, p_n, _ = self.forward(north[:, 0:3])
-        loss_north_p = F.mse_loss(p_n, north[:, 3:4])
+        _, _, p_n, _ = self.forward(north[:, 0:4])
+        loss_north_p = F.mse_loss(p_n, north[:, 4:5])
 
         east_west = batches["east_west"]
-        u_e, v_e, p_e, _ = self.forward(torch.stack([east_west[:, 0], east_west[:, 1], east_west[:, 4]], dim=1))
-        u_w, v_w, p_w, _ = self.forward(east_west[:, 2:5])
+        u_e, v_e, p_e, _ = self.forward(east_west[:, 0:4])
+        u_w, v_w, p_w, _ = self.forward(east_west[:, 4:8])
         loss_ew = F.mse_loss(u_e, u_w) + F.mse_loss(v_e, v_w) + F.mse_loss(p_e, p_w)
 
         nsew = batches["nsew"]
-        u_b, v_b, _, _ = self.forward(nsew[:, 0:3])
-        loss_velocity_bc = F.mse_loss(u_b, nsew[:, 3:4]) + F.mse_loss(v_b, nsew[:, 4:5])
+        u_b, v_b, _, _ = self.forward(nsew[:, 0:4])
+        loss_velocity_bc = F.mse_loss(u_b, nsew[:, 4:5]) + F.mse_loss(v_b, nsew[:, 5:6])
         loss_boundary = loss_north_p + loss_ew + loss_velocity_bc
 
         pde_batch = batches["pde"]
-        target = pde_batch[:, 3:4]
-        mass, momentum_x, momentum_y, alpha_transport = self.pde_residuals(pde_batch[:, 0:3])
+        target = pde_batch[:, 4:5]
+        mass, momentum_x, momentum_y, alpha_transport = self.pde_residuals(pde_batch[:, 0:4])
         loss_mass = F.mse_loss(mass, target)
         loss_momentum_x = F.mse_loss(momentum_x, target)
         loss_momentum_y = F.mse_loss(momentum_y, target)
