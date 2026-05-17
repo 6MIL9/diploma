@@ -1,0 +1,76 @@
+{
+  "data_path": "exp/train",
+  "output_dir": "checkpoints_param",
+  "hidden_layers": [
+    350,
+    350,
+    350,
+    350,
+    350,
+    350,
+    350,
+    350
+  ],
+  "activation": "tanh",
+  "points": {
+    "alpha": [
+      500,
+      400
+    ],
+    "pde": [
+      400,
+      2000,
+      3000
+    ],
+    "north": [
+      20,
+      20
+    ],
+    "south": [
+      20,
+      20
+    ],
+    "east": [
+      20,
+      20
+    ],
+    "west": [
+      20,
+      20
+    ]
+  },
+  "physics": {
+    "mu": [
+      1.0,
+      10.0
+    ],
+    "rho": [
+      100.0,
+      1000.0
+    ],
+    "sigma": 24.5,
+    "g": -0.98,
+    "u_ref": 1.0,
+    "l_ref": 0.25,
+    "p_ref_rho": 1000.0
+  },
+  "loss_weights_pde": [
+    1.0,
+    10.0,
+    10.0,
+    1.0
+  ],
+  "epochs": [
+    5000
+  ],
+  "learning_rates": [
+    0.0001
+  ],
+  "batch_size": null,
+  "num_batches": 20,
+  "checkpoint_interval": 100,
+  "seed": 1234,
+  "device": "auto",
+  "dtype": "float32",
+  "num_workers": 0
+}

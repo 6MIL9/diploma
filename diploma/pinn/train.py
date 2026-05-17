@@ -110,7 +110,7 @@ def save_checkpoint(
 
 
 class TrainingRun:
-    def __init__(self, cfg: TrainingConfig):
+    def __init__(self, cfg: TrainingConfig, run_dir: Path | None = None):
         if len(cfg.epochs) != len(cfg.learning_rates):
             raise ValueError("epochs and learning_rates must have the same length.")
 
@@ -123,8 +123,10 @@ class TrainingRun:
         self.data = make_training_data(cfg.data_path, cfg.points, cfg.physics.l_ref, cfg.seed).to(self.device, self.dtype)
         print("Training point counts:", self.data.sizes)
 
-        self.run_dir = make_run_dir(cfg.output_dir)
-        (self.run_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2), encoding="utf-8")
+        self.run_dir = make_run_dir(cfg.output_dir) if run_dir is None else Path(run_dir)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        if run_dir is None:
+            (self.run_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2), encoding="utf-8")
 
         self.model = TwoPhasePINN(cfg.hidden_layers, cfg.physics, cfg.activation, cfg.loss_weights_pde).to(
             device=self.device,
@@ -146,6 +148,19 @@ class TrainingRun:
         self.best_loss = float("inf")
         self.global_epoch = 0
         self.current_stage = 0
+
+    def load_checkpoint(self, checkpoint_path: Path) -> None:
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model_state"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+        self.history = checkpoint.get("history", [])
+        self.global_epoch = int(checkpoint.get("epoch", 0))
+        self.current_stage = int(checkpoint.get("stage", 0))
+        self.best_loss = min((row["total"] for row in self.history), default=float(checkpoint.get("loss", "inf")))
+        print(
+            f"Resumed from {checkpoint_path}: "
+            f"epoch={self.global_epoch}, stage={self.current_stage}, best_loss={self.best_loss:.3e}"
+        )
 
     def _write_history(self) -> None:
         (self.run_dir / "history.json").write_text(json.dumps(self.history, indent=2), encoding="utf-8")
@@ -226,14 +241,18 @@ class TrainingRun:
         return stage_history
 
     def train_all(self) -> Path:
-        for stage, (stage_epochs, lr) in enumerate(zip(self.cfg.epochs, self.cfg.learning_rates), start=1):
+        start_stage = self.current_stage + 1
+        for stage, (stage_epochs, lr) in enumerate(zip(self.cfg.epochs, self.cfg.learning_rates), start=start_stage):
             self.train_stage(stage_epochs, lr, stage=stage)
         print(f"Finished. Best checkpoint: {self.run_dir / 'best.pt'}")
         return self.run_dir
 
 
-def train(cfg: TrainingConfig) -> Path:
-    return TrainingRun(cfg).train_all()
+def train(cfg: TrainingConfig, resume: Path | None = None) -> Path:
+    run = TrainingRun(cfg, run_dir=resume.parent if resume is not None else None)
+    if resume is not None:
+        run.load_checkpoint(resume)
+    return run.train_all()
 
 
 def parse_args() -> argparse.Namespace:
@@ -249,6 +268,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-width", type=int, default=None)
     parser.add_argument("--hidden-depth", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None, help="Override with a single learning rate stage.")
+    parser.add_argument("--resume", type=Path, default=None, help="Resume from a checkpoint such as checkpoints/.../last.pt.")
     parser.add_argument("--seed", type=int, default=None)
     return parser.parse_args()
 
@@ -281,7 +301,7 @@ def main() -> None:
         cfg.hidden_layers = (width,) * depth
     if args.seed is not None:
         cfg.seed = args.seed
-    train(cfg)
+    train(cfg, resume=args.resume)
 
 
 if __name__ == "__main__":

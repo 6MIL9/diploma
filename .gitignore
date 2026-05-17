@@ -40,3 +40,7 @@ diploma/cfd_basilisk/interface-*.dat
 diploma/cfd_basilisk/runs/
 diploma/exp/
 diploma/checkpoints_param_smoke/
+diploma/checkpoints_param_medium_2stage/light/epoch_*.pt
+diploma/checkpoints_param_medium_2stage/medium/epoch_*.pt
+diploma/checkpoints_param_paper_2stage/hard/epoch_*.pt
+diploma/checkpoints_param/multi/epoch_*.pt
