@@ -83,6 +83,14 @@ event logfile (i++)
   fflush (stdout);
 }
 
+#ifdef NO_SNAPSHOTS
+event stop (t = T_END)
+{
+  return 1;
+}
+#endif
+
+#ifndef NO_SNAPSHOTS
 event snapshots (t = 0.; t <= T_END + 1e-12; t += SNAPSHOT_DT)
 {
   char name[128];
@@ -101,3 +109,4 @@ event interface (t = T_END)
   output_facets (f, fp);
   fclose (fp);
 }
+#endif
