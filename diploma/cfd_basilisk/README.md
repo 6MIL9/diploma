@@ -101,6 +101,25 @@ cd ..
   --data-path cfd_data/rising_bubble_basilisk_r020.h5
 ```
 
+## 4. Benchmark PINN prediction time against Basilisk
+
+Use `benchmark_prediction_time.py` from the repository root to measure how long a trained checkpoint needs to predict
+`K` time snapshots on the same grid and how long Basilisk needs to compute up to the last of those snapshots:
+
+```bash
+.venv/bin/python diploma/benchmark_prediction_time.py \
+  --checkpoint diploma/checkpoints_param_medium_2stage/medium/best.pt \
+  --data-path diploma/cfd_data/rising_bubble_basilisk_r020.h5 \
+  -K 10 \
+  --spatial-step 1 \
+  --basilisk-level 8 \
+  --json-output diploma/cfd_basilisk/runs/benchmark/result.json
+```
+
+For a network-only timing, add `--skip-basilisk`. The reported PINN time is the median pure forward-pass time after
+warmup; input tensor preparation is printed separately. The Basilisk time is wall-clock solver runtime, with compilation
+time reported separately.
+
 ## Notes
 
 The Basilisk reference case uses a rotated half-domain: vertical coordinate `x in [0, 2]` and horizontal coordinate `y in [0, 0.5]`. The converter mirrors it into the same orientation as your HDF5/PINN data: `X in [-0.5, 0.5]`, `Y in [0, 2]`.
