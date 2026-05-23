@@ -297,10 +297,13 @@ def make_training_data(
     cfg: PointConfig,
     l_ref: float,
     seed: int = 1234,
+    parameterized: bool = True,
 ) -> TrainingData:
     data_paths = resolve_data_paths(data_path)
+    if not parameterized and len(data_paths) != 1:
+        raise ValueError("Ordinary PINN training requires exactly one HDF5 data file.")
     chunks = [
-        _make_training_data_single(path, cfg, l_ref, seed + index)
+        _make_training_data_single(path, cfg, l_ref, seed + index, parameterized)
         for index, path in enumerate(data_paths)
     ]
     return _concat_training_data(chunks)
@@ -311,6 +314,7 @@ def _make_training_data_single(
     cfg: PointConfig,
     l_ref: float,
     seed: int,
+    parameterized: bool,
 ) -> TrainingData:
     data_path = Path(data_path)
     if not data_path.exists():
@@ -348,26 +352,33 @@ def _make_training_data_single(
     for arr in (alpha, pde, north, south, east, west, nsew_coords, nsew_for_pde):
         arr[:, :3] /= l_ref
 
-    alpha = _append_radius_column(alpha, radius)
-    pde = _append_radius_column(pde, radius)
-    nsew_for_pde = _append_radius_column(nsew_for_pde, radius)
-
-    east_west = np.hstack(
-        [
-            east[:, 0:3],
-            radius * np.ones((len(east), 1), dtype=east.dtype),
-            west[:, 0:3],
-            radius * np.ones((len(west), 1), dtype=west.dtype),
-        ]
-    )
     nsew_raw = np.vstack([north[:, 0:5], south, east[: cfg.east[0]], west[: cfg.west[0]]])
-    nsew = _append_radius_column(nsew_raw, radius)
+
+    if parameterized:
+        alpha = _append_radius_column(alpha, radius)
+        pde = _append_radius_column(pde, radius)
+        nsew_for_pde = _append_radius_column(nsew_for_pde, radius)
+        east_west = np.hstack(
+            [
+                east[:, 0:3],
+                radius * np.ones((len(east), 1), dtype=east.dtype),
+                west[:, 0:3],
+                radius * np.ones((len(west), 1), dtype=west.dtype),
+            ]
+        )
+        nsew = _append_radius_column(nsew_raw, radius)
+        north_out = _append_radius_column(north[:, [0, 1, 2, 5]], radius)
+    else:
+        east_west = np.hstack([east[:, 0:3], west[:, 0:3]])
+        nsew = nsew_raw
+        north_out = north[:, [0, 1, 2, 5]]
+
     pde = np.vstack([pde, nsew_for_pde])
 
     return TrainingData(
         alpha=torch.from_numpy(alpha.astype(np.float32)),
         pde=torch.from_numpy(pde.astype(np.float32)),
-        north=torch.from_numpy(_append_radius_column(north[:, [0, 1, 2, 5]], radius).astype(np.float32)),
+        north=torch.from_numpy(north_out.astype(np.float32)),
         east_west=torch.from_numpy(east_west.astype(np.float32)),
         nsew=torch.from_numpy(nsew.astype(np.float32)),
     )

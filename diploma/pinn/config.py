@@ -34,6 +34,7 @@ class TrainingConfig:
     points: PointConfig = field(default_factory=PointConfig)
     physics: PhysicsConfig = field(default_factory=PhysicsConfig)
     loss_weights_pde: tuple[float, float, float, float] = (1.0, 10.0, 10.0, 1.0)
+    parameterized: bool = True
     epochs: tuple[int, ...] = (1000, 1000, 1000)
     learning_rates: tuple[float, ...] = (1e-4, 5e-5, 1e-5)
     batch_size: int | None = 4096

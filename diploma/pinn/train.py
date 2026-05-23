@@ -120,7 +120,13 @@ class TrainingRun:
         self.dtype = resolve_dtype(cfg.dtype)
 
         print(f"Loading and sampling training data from {cfg.data_path}")
-        self.data = make_training_data(cfg.data_path, cfg.points, cfg.physics.l_ref, cfg.seed).to(self.device, self.dtype)
+        self.data = make_training_data(
+            cfg.data_path,
+            cfg.points,
+            cfg.physics.l_ref,
+            cfg.seed,
+            parameterized=cfg.parameterized,
+        ).to(self.device, self.dtype)
         print("Training point counts:", self.data.sizes)
 
         self.run_dir = make_run_dir(cfg.output_dir) if run_dir is None else Path(run_dir)
@@ -128,7 +134,14 @@ class TrainingRun:
         if run_dir is None:
             (self.run_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2), encoding="utf-8")
 
-        self.model = TwoPhasePINN(cfg.hidden_layers, cfg.physics, cfg.activation, cfg.loss_weights_pde).to(
+        input_dim = 4 if cfg.parameterized else 3
+        self.model = TwoPhasePINN(
+            cfg.hidden_layers,
+            cfg.physics,
+            cfg.activation,
+            cfg.loss_weights_pde,
+            input_dim=input_dim,
+        ).to(
             device=self.device,
             dtype=self.dtype,
         )
@@ -270,6 +283,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=None, help="Override with a single learning rate stage.")
     parser.add_argument("--resume", type=Path, default=None, help="Resume from a checkpoint such as checkpoints/.../last.pt.")
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--ordinary-pinn",
+        action="store_false",
+        dest="parameterized",
+        help="Train a non-parametric model with inputs (x, y, t). Requires a single HDF5 data file.",
+    )
+    parser.add_argument(
+        "--parameterized-pinn",
+        action="store_true",
+        dest="parameterized",
+        help="Train a parametric model with inputs (x, y, t, R).",
+    )
+    parser.set_defaults(parameterized=None)
     return parser.parse_args()
 
 
@@ -301,6 +327,8 @@ def main() -> None:
         cfg.hidden_layers = (width,) * depth
     if args.seed is not None:
         cfg.seed = args.seed
+    if args.parameterized is not None:
+        cfg.parameterized = args.parameterized
     train(cfg, resume=args.resume)
 
 
