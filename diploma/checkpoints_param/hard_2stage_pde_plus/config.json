@@ -1,6 +1,6 @@
 {
   "data_path": "exp/train",
-  "output_dir": "checkpoints_param",
+  "output_dir": "checkpoints_hard_pde_plus",
   "hidden_layers": [
     350,
     350,
@@ -18,9 +18,9 @@
       400
     ],
     "pde": [
-      400,
-      2000,
-      3000
+      800,
+      4000,
+      6000
     ],
     "north": [
       20,
@@ -60,11 +60,14 @@
     10.0,
     1.0
   ],
+  "parameterized": true,
   "epochs": [
+    5000,
     5000
   ],
   "learning_rates": [
-    0.0001
+    0.0001,
+    5e-05
   ],
   "batch_size": null,
   "num_batches": 20,
